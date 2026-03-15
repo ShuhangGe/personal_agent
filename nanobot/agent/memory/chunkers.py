@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import re
-from typing import list
 from dataclasses import dataclass
 
 from loguru import logger
