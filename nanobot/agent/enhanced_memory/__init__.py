@@ -1,6 +1,6 @@
 """Enhanced memory system with vector database and semantic search."""
 
-from nanobot.agent.memory.types import (
+from nanobot.agent.enhanced_memory.types import (
     MemoryEntry,
     MemorySearchConfig,
     MemorySearchResult,
@@ -8,23 +8,23 @@ from nanobot.agent.memory.types import (
     MemorySource,
     SearchMode,
 )
-from nanobot.agent.memory.embeddings import (
+from nanobot.agent.enhanced_memory.embeddings import (
     EmbeddingProvider,
     create_embedding_provider,
     OpenAIEmbeddingProvider,
     LocalEmbeddingProvider,
     OllamaEmbeddingProvider,
 )
-from nanobot.agent.memory.vector_store import VectorStore
-from nanobot.agent.memory.search import MemorySearchEngine
-from nanobot.agent.memory.chunkers import (
+from nanobot.agent.enhanced_memory.vector_store import VectorStore
+from nanobot.agent.enhanced_memory.search import MemorySearchEngine
+from nanobot.agent.enhanced_memory.chunkers import (
     FixedSizeChunker,
     SemanticChunker,
     CodeChunker,
     get_chunker,
     estimate_tokens,
 )
-from nanobot.agent.memory.enhanced_memory import (
+from nanobot.agent.enhanced_memory.enhanced_memory import (
     EnhancedMemorySystem,
     EnhancedMemoryConsolidator,
 )

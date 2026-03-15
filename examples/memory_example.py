@@ -3,7 +3,7 @@
 import asyncio
 from pathlib import Path
 
-from nanobot.agent.memory import (
+from nanobot.agent.enhanced_memory import (
     EnhancedMemorySystem,
     MemorySource,
     SearchMode,
@@ -67,6 +67,7 @@ async def main():
             query="What programming languages do I like?",
             mode=SearchMode.VECTOR,
             max_results=5,
+            similarity_threshold=0.0,  # Show all results
         )
 
         print(f"\n📊 Vector search results ({result.total_results} found):")
@@ -78,6 +79,7 @@ async def main():
             query="programming code",
             mode=SearchMode.HYBRID,
             max_results=5,
+            similarity_threshold=0.0,  # Show all results
         )
 
         print(f"\n📊 Hybrid search results ({result.total_results} found):")

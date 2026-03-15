@@ -23,15 +23,15 @@ except ImportError:
     WHOOSH_AVAILABLE = False
     logger.warning("Whoosh not available, keyword search will be limited")
 
-from nanobot.agent.memory.types import (
+from nanobot.agent.enhanced_memory.types import (
     MemorySearchConfig,
     MemorySearchResult,
     SearchResult,
     SearchMode,
     MemoryEntry,
 )
-from nanobot.agent.memory.vector_store import VectorStore
-from nanobot.agent.memory.embeddings import EmbeddingProvider
+from nanobot.agent.enhanced_memory.vector_store import VectorStore
+from nanobot.agent.enhanced_memory.embeddings import EmbeddingProvider
 
 
 class MemorySearchEngine:
@@ -164,7 +164,7 @@ class MemorySearchEngine:
                 results, estimated_tokens = self._apply_token_limit(
                     results, config.max_tokens
                 )
-                filtered_by_tokens = len(results) < config.min(config.max_results, len(results))
+                filtered_by_tokens = len(results) < min(config.max_results, len(results))
 
             search_time = (time.time() - start_time) * 1000  # Convert to ms
 

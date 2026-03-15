@@ -19,7 +19,7 @@ except ImportError:
     CHROMADB_AVAILABLE = False
     logger.warning("ChromaDB not available, vector search will be limited")
 
-from nanobot.agent.memory.types import MemoryEntry, MemorySource, SearchResult
+from nanobot.agent.enhanced_memory.types import MemoryEntry, MemorySource, SearchResult
 
 
 class VectorStore:

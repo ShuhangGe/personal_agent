@@ -10,18 +10,18 @@ from typing import Any, Optional
 
 from loguru import logger
 
-from nanobot.agent.memory import (
+from nanobot.agent.enhanced_memory.types import (
     MemoryEntry,
     MemorySearchConfig,
     MemorySearchResult,
     MemorySource,
     SearchMode,
 )
-from nanobot.agent.memory.embeddings import create_embedding_provider
-from nanobot.agent.memory.vector_store import VectorStore
-from nanobot.agent.memory.search import MemorySearchEngine
-from nanobot.agent.memory.chunkers import get_chunker
-from nanobot.agent.memory.memory import MemoryStore, MemoryConsolidator
+from nanobot.agent.enhanced_memory.embeddings import create_embedding_provider
+from nanobot.agent.enhanced_memory.vector_store import VectorStore
+from nanobot.agent.enhanced_memory.search import MemorySearchEngine
+from nanobot.agent.enhanced_memory.chunkers import get_chunker
+from nanobot.agent.memory import MemoryStore, MemoryConsolidator
 
 
 class EnhancedMemorySystem:
@@ -37,6 +37,9 @@ class EnhancedMemorySystem:
         enable_keyword_search: bool = True,
     ):
         self.workspace = workspace
+        self.embedding_provider_type = embedding_provider_type
+        self.api_key = api_key
+        self.embedding_model = embedding_model
         self.enable_vector_search = enable_vector_search
         self.enable_keyword_search = enable_keyword_search
 
