@@ -1,4 +1,4 @@
-"""Spawn tool for creating background subagents."""
+"""Spawn tool for delegating tasks to expert subagents."""
 
 from typing import TYPE_CHECKING, Any
 
@@ -9,7 +9,7 @@ if TYPE_CHECKING:
 
 
 class SpawnTool(Tool):
-    """Tool to spawn a subagent for background task execution."""
+    """Tool to spawn an expert subagent for task execution."""
 
     def __init__(self, manager: "SubagentManager"):
         self._manager = manager
@@ -18,7 +18,7 @@ class SpawnTool(Tool):
         self._session_key = "cli:direct"
 
     def set_context(self, channel: str, chat_id: str) -> None:
-        """Set the origin context for subagent announcements."""
+        """Set the origin context for expert announcements."""
         self._origin_channel = channel
         self._origin_chat_id = chat_id
         self._session_key = f"{channel}:{chat_id}"
@@ -30,9 +30,10 @@ class SpawnTool(Tool):
     @property
     def description(self) -> str:
         return (
-            "Spawn a subagent to handle a task in the background. "
-            "Use this for complex or time-consuming tasks that can run independently. "
-            "The subagent will complete the task and report back when done."
+            "Spawn an expert subagent to handle a task. "
+            "Use expert_name to reuse a saved expert, or omit it for a new generic expert. "
+            "The expert will work independently, maintain a live work log, "
+            "save detailed results to a file, and report back a short summary when done."
         )
 
     @property
@@ -42,21 +43,44 @@ class SpawnTool(Tool):
             "properties": {
                 "task": {
                     "type": "string",
-                    "description": "The task for the subagent to complete",
+                    "description": (
+                        "Detailed task description with all necessary context for the expert. "
+                        "Be specific — the expert cannot see the conversation history."
+                    ),
+                },
+                "expert_name": {
+                    "type": "string",
+                    "description": (
+                        "Name of a saved expert to use (from the expert library). "
+                        "Omit to spawn a generic expert for new task types."
+                    ),
                 },
                 "label": {
                     "type": "string",
-                    "description": "Optional short label for the task (for display)",
+                    "description": "Short display label for tracking (shown to user)",
+                },
+                "context": {
+                    "type": "string",
+                    "description": "Relevant conversation context or background info the expert needs",
                 },
             },
             "required": ["task"],
         }
 
-    async def execute(self, task: str, label: str | None = None, **kwargs: Any) -> str:
-        """Spawn a subagent to execute the given task."""
+    async def execute(
+        self,
+        task: str,
+        expert_name: str | None = None,
+        label: str | None = None,
+        context: str | None = None,
+        **kwargs: Any,
+    ) -> str:
+        """Spawn an expert subagent to execute the given task."""
         return await self._manager.spawn(
             task=task,
             label=label,
+            expert_name=expert_name,
+            context=context,
             origin_channel=self._origin_channel,
             origin_chat_id=self._origin_chat_id,
             session_key=self._session_key,

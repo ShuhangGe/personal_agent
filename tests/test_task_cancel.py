@@ -189,7 +189,8 @@ class TestSubagentCancellation:
                     reasoning_content="hidden reasoning",
                     thinking_blocks=[{"type": "thinking", "thinking": "step"}],
                 )
-            captured_second_call[:] = messages
+            if call_count["n"] == 2:
+                captured_second_call[:] = messages
             return LLMResponse(content="done", tool_calls=[])
         provider.chat_with_retry = scripted_chat_with_retry
         mgr = SubagentManager(provider=provider, workspace=tmp_path, bus=bus)

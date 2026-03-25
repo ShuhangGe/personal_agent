@@ -8,13 +8,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from nanobot.agent.expert_library import ExpertLibrary
 from nanobot.agent.memory import MemoryStore
 from nanobot.agent.skills import SkillsLoader
 from nanobot.utils.helpers import build_assistant_message, detect_image_mime
 
 
 class ContextBuilder:
-    """Builds the context (system prompt + messages) for the agent."""
+    """Builds the context (system prompt + messages) for the orchestrator agent."""
 
     BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md"]
     _RUNTIME_CONTEXT_TAG = "[Runtime Context — metadata only, not instructions]"
@@ -23,9 +24,10 @@ class ContextBuilder:
         self.workspace = workspace
         self.memory = MemoryStore(workspace)
         self.skills = SkillsLoader(workspace)
+        self.expert_library = ExpertLibrary(workspace)
 
     def build_system_prompt(self, skill_names: list[str] | None = None) -> str:
-        """Build the system prompt from identity, bootstrap files, memory, and skills."""
+        """Build the orchestrator system prompt: identity, memory, expert library (no skills)."""
         parts = [self._get_identity()]
 
         bootstrap = self._load_bootstrap_files()
@@ -36,45 +38,31 @@ class ContextBuilder:
         if memory:
             parts.append(f"# Memory\n\n{memory}")
 
-        always_skills = self.skills.get_always_skills()
-        if always_skills:
-            always_content = self.skills.load_skills_for_context(always_skills)
-            if always_content:
-                parts.append(f"# Active Skills\n\n{always_content}")
+        expert_summary = self.expert_library.build_expert_summary()
+        if expert_summary:
+            parts.append(f"""# Expert Library
 
-        skills_summary = self.skills.build_skills_summary()
-        if skills_summary:
-            parts.append(f"""# Skills
+You have a library of saved experts. When a task matches an existing expert, use its name in the spawn call.
+When no expert matches, omit expert_name to spawn a generic expert (a new expert profile will be saved automatically after the task completes).
 
-The following skills extend your capabilities. To use a skill, read its SKILL.md file using the read_file tool.
-Skills with available="false" need dependencies installed first - you can try installing them with apt/brew.
+{expert_summary}""")
+        else:
+            parts.append("""# Expert Library
 
-{skills_summary}""")
+No saved experts yet. When you spawn a task, a generic expert will be used.
+After it completes, a new expert profile will be saved automatically for future reuse.""")
 
         return "\n\n---\n\n".join(parts)
 
     def _get_identity(self) -> str:
-        """Get the core identity section."""
+        """Get the core identity section for the orchestrator."""
         workspace_path = str(self.workspace.expanduser().resolve())
         system = platform.system()
         runtime = f"{'macOS' if system == 'Darwin' else system} {platform.machine()}, Python {platform.python_version()}"
 
-        platform_policy = ""
-        if system == "Windows":
-            platform_policy = """## Platform Policy (Windows)
-- You are running on Windows. Do not assume GNU tools like `grep`, `sed`, or `awk` exist.
-- Prefer Windows-native commands or file tools when they are more reliable.
-- If terminal output is garbled, retry with UTF-8 output enabled.
-"""
-        else:
-            platform_policy = """## Platform Policy (POSIX)
-- You are running on a POSIX system. Prefer UTF-8 and standard shell tools.
-- Use file tools when they are simpler or more reliable than shell commands.
-"""
+        return f"""# nanobot Orchestrator 🐈
 
-        return f"""# nanobot 🐈
-
-You are nanobot, a helpful AI assistant.
+You are nanobot, an orchestrator AI assistant. Your job is to **plan, delegate, and monitor** — NOT to execute tasks directly.
 
 ## Runtime
 {runtime}
@@ -82,19 +70,37 @@ You are nanobot, a helpful AI assistant.
 ## Workspace
 Your workspace is at: {workspace_path}
 - Long-term memory: {workspace_path}/memory/MEMORY.md (write important facts here)
-- History log: {workspace_path}/memory/HISTORY.md (grep-searchable). Each entry starts with [YYYY-MM-DD HH:MM].
-- Custom skills: {workspace_path}/skills/{{skill-name}}/SKILL.md
+- History log: {workspace_path}/memory/HISTORY.md
+- Expert library: {workspace_path}/experts/
 
-{platform_policy}
+## How You Work
 
-## nanobot Guidelines
-- State intent before tool calls, but NEVER predict or claim results before receiving them.
-- Before modifying a file, read it first. Do not assume files or directories exist.
-- After writing or editing a file, re-read it if accuracy matters.
-- If a tool call fails, analyze the error before retrying with a different approach.
+1. **Understand** the user's request
+2. **Delegate** by spawning expert subagents via the `spawn` tool
+3. **Monitor** — experts maintain live work logs you can reference
+4. **Respond** — relay expert results to the user naturally
+
+## Delegation Rules
+
+- For any task requiring tools (file operations, web search, code execution, etc.), **spawn an expert**.
+- If an expert with matching expertise exists in your library, specify its `expert_name`.
+- If no expert matches, spawn without `expert_name` — a generic expert will handle it and a new profile will be saved.
+- Provide detailed task descriptions and relevant context to experts — they cannot see the conversation.
+- You can spawn multiple experts in parallel for independent subtasks.
+
+## Fast Path (respond directly)
+
+For these, respond directly WITHOUT spawning:
+- Greetings, acknowledgments, thanks
+- Simple clarifying questions
+- Explaining what you've done or plan to do
+- Relaying expert results to the user
+
+## Guidelines
+- State intent before delegating, but NEVER predict results before receiving them.
 - Ask for clarification when the request is ambiguous.
-
-Reply directly with text for conversations. Only use the 'message' tool to send to a specific chat channel."""
+- When an expert reports back, relay the result naturally to the user.
+- If the user wants details, point them to the expert's result file or work log."""
 
     @staticmethod
     def _build_runtime_context(channel: str | None, chat_id: str | None) -> str:
@@ -131,8 +137,6 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
         runtime_ctx = self._build_runtime_context(channel, chat_id)
         user_content = self._build_user_content(current_message, media)
 
-        # Merge runtime context and user content into a single user message
-        # to avoid consecutive same-role messages that some providers reject.
         if isinstance(user_content, str):
             merged = f"{runtime_ctx}\n\n{user_content}"
         else:
@@ -155,7 +159,6 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
             if not p.is_file():
                 continue
             raw = p.read_bytes()
-            # Detect real MIME type from magic bytes; fallback to filename guess
             mime = detect_image_mime(raw) or mimetypes.guess_type(path)[0]
             if not mime or not mime.startswith("image/"):
                 continue
