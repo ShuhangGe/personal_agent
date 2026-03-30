@@ -24,6 +24,8 @@ class ExpertLibrary:
                 HISTORY.md      # Grep-searchable task log
             results/
                 {timestamp}.md  # Detailed result files
+            workspace/          # Expert's isolated file sandbox
+            sessions/           # Persistent conversation history across runs
     """
 
     def __init__(self, workspace: Path):
@@ -61,6 +63,14 @@ class ExpertLibrary:
 
     def expert_exists(self, name: str) -> bool:
         return (self.get_expert_dir(name) / "EXPERT.md").exists()
+
+    def get_expert_workspace(self, name: str) -> Path:
+        """Return the expert's isolated workspace directory, creating it if needed."""
+        return ensure_dir(self.get_expert_dir(name) / "workspace")
+
+    def get_expert_sessions_dir(self, name: str) -> Path:
+        """Return the expert's sessions directory, creating it if needed."""
+        return ensure_dir(self.get_expert_dir(name) / "sessions")
 
     def list_experts(self) -> list[dict]:
         """List all experts with their registry metadata."""
@@ -207,6 +217,8 @@ class ExpertLibrary:
             hist_path.write_text("", encoding="utf-8")
 
         ensure_dir(self.get_expert_dir(name) / "results")
+        ensure_dir(self.get_expert_dir(name) / "workspace")
+        ensure_dir(self.get_expert_dir(name) / "sessions")
 
         self.update_registry_entry(
             name,

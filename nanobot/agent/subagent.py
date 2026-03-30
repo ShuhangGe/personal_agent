@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shutil
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -20,7 +21,8 @@ from nanobot.bus.events import InboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.config.schema import ExecToolConfig
 from nanobot.providers.base import LLMProvider
-from nanobot.utils.helpers import build_assistant_message
+from nanobot.session.manager import Session, SessionManager
+from nanobot.utils.helpers import build_assistant_message, ensure_dir
 
 
 _SAVE_EXPERT_TOOL = [
@@ -59,9 +61,11 @@ _SAVE_EXPERT_TOOL = [
     }
 ]
 
+_TOOL_RESULT_MAX_CHARS = 16_000
+
 
 class SubagentManager:
-    """Manages expert subagent execution with persistent profiles and memory."""
+    """Manages expert subagent execution with isolated workspaces and persistent sessions."""
 
     def __init__(
         self,
@@ -123,6 +127,8 @@ class SubagentManager:
         logger.info("Spawned subagent [{}]{}: {}", task_id, expert_info, display_label)
         return f"Expert{expert_info} started for: {display_label} (id: {task_id}). I'll notify you when it completes."
 
+    # ── Core execution ────────────────────────────────────────────────────
+
     async def _run_subagent(
         self,
         task_id: str,
@@ -132,14 +138,30 @@ class SubagentManager:
         expert_name: str | None = None,
         context: str | None = None,
     ) -> None:
-        """Execute the expert subagent task with worklog updates."""
+        """Execute the expert subagent with its own workspace, session, and memory."""
         logger.info("Expert [{}] starting task: {}", task_id, label)
         tools_used: list[str] = []
         effective_expert_name = expert_name
 
+        # Resolve the expert's isolated workspace and session storage.
+        # For known experts, use their permanent directory.
+        # For generic (first-time) experts, use a temp name that will be
+        # migrated after the expert profile is created.
+        temp_name = f"_task-{task_id}"
+        expert_dir_name = expert_name if (expert_name and self.expert_library.expert_exists(expert_name)) else temp_name
+        expert_workspace = self.expert_library.get_expert_workspace(expert_dir_name)
+        expert_sessions_dir = self.expert_library.get_expert_sessions_dir(expert_dir_name)
+
         try:
-            tools = self._build_expert_tools()
-            system_prompt = self._build_expert_prompt(expert_name, context)
+            tools = self._build_expert_tools(expert_workspace)
+            system_prompt = self._build_expert_prompt(expert_name, context, expert_workspace)
+
+            # Load persistent session history for known experts
+            expert_session_mgr = SessionManager(
+                self.expert_library.get_expert_dir(expert_dir_name)
+            )
+            session = expert_session_mgr.get_or_create("expert")
+            history = session.get_history(max_messages=0)
 
             user_message = task
             if context:
@@ -147,6 +169,7 @@ class SubagentManager:
 
             messages: list[dict[str, Any]] = [
                 {"role": "system", "content": system_prompt},
+                *history,
                 {"role": "user", "content": user_message},
             ]
 
@@ -192,9 +215,13 @@ class SubagentManager:
             if final_result is None:
                 final_result = "Task completed but no final response was generated."
 
-            # Save detailed result to file and get short summary
+            # Save this conversation turn into the expert's persistent session
+            self._save_session_turn(session, messages, 1 + len(history))
+            expert_session_mgr.save(session)
+
+            # Save detailed result to file
             result_path, worklog_path = self._save_task_artifacts(
-                expert_name=effective_expert_name,
+                expert_name=expert_dir_name,
                 task_id=task_id,
                 task=task,
                 label=label,
@@ -203,9 +230,10 @@ class SubagentManager:
                 status="success",
             )
 
-            # Post-completion: create/update expert profile
-            await self._post_completion(
+            # Post-completion: create/update expert profile and memory
+            created_name = await self._post_completion(
                 expert_name=effective_expert_name,
+                temp_name=temp_name,
                 task=task,
                 final_result=final_result,
                 tools_used=list(set(tools_used)),
@@ -214,6 +242,14 @@ class SubagentManager:
 
             short_summary = self._extract_short_summary(final_result)
             logger.info("Expert [{}] completed successfully", task_id)
+
+            # If a new expert was created from a temp task, update paths for the announcement
+            if created_name and created_name != expert_dir_name:
+                new_results = self.expert_library.list_results(created_name)
+                if new_results:
+                    result_path = new_results[0]
+                worklog_path = self.expert_library.get_worklog_path(created_name)
+
             await self._announce_result(
                 task_id, label, task, short_summary, result_path, worklog_path, origin, "ok"
             )
@@ -223,7 +259,7 @@ class SubagentManager:
             logger.error("Expert [{}] failed: {}", task_id, e)
 
             result_path, worklog_path = self._save_task_artifacts(
-                expert_name=effective_expert_name,
+                expert_name=expert_dir_name,
                 task_id=task_id,
                 task=task,
                 label=label,
@@ -236,25 +272,29 @@ class SubagentManager:
                 task_id, label, task, error_msg, result_path, worklog_path, origin, "error"
             )
 
-    def _build_expert_tools(self) -> ToolRegistry:
-        """Build the full tool set for an expert subagent."""
+    # ── Tool and prompt building ──────────────────────────────────────────
+
+    def _build_expert_tools(self, expert_workspace: Path) -> ToolRegistry:
+        """Build the full tool set, sandboxed to the expert's own workspace."""
         tools = ToolRegistry()
-        allowed_dir = self.workspace if self.restrict_to_workspace else None
-        tools.register(ReadFileTool(workspace=self.workspace, allowed_dir=allowed_dir))
-        tools.register(WriteFileTool(workspace=self.workspace, allowed_dir=allowed_dir))
-        tools.register(EditFileTool(workspace=self.workspace, allowed_dir=allowed_dir))
-        tools.register(ListDirTool(workspace=self.workspace, allowed_dir=allowed_dir))
+        for cls in (ReadFileTool, WriteFileTool, EditFileTool, ListDirTool):
+            tools.register(cls(workspace=expert_workspace, allowed_dir=expert_workspace))
         tools.register(ExecTool(
-            working_dir=str(self.workspace),
+            working_dir=str(expert_workspace),
             timeout=self.exec_config.timeout,
-            restrict_to_workspace=self.restrict_to_workspace,
+            restrict_to_workspace=True,
             path_append=self.exec_config.path_append,
         ))
         tools.register(WebSearchTool(config=self.web_search_config, proxy=self.web_proxy))
         tools.register(WebFetchTool(proxy=self.web_proxy))
         return tools
 
-    def _build_expert_prompt(self, expert_name: str | None, context: str | None) -> str:
+    def _build_expert_prompt(
+        self,
+        expert_name: str | None,
+        context: str | None,
+        expert_workspace: Path,
+    ) -> str:
         """Build the expert subagent system prompt with profile, memory, skills, and worklog instructions."""
         from nanobot.agent.context import ContextBuilder
         from nanobot.agent.skills import SkillsLoader
@@ -268,8 +308,11 @@ class SubagentManager:
 You are an expert subagent spawned by the orchestrator to complete a specific task.
 You have full access to tools and skills. Stay focused on the assigned task.
 
-## Workspace
-{self.workspace}
+## Your Workspace
+{expert_workspace}
+
+This is YOUR isolated workspace. All files you create or edit live here.
+Use relative paths when possible — they resolve against your workspace.
 """]
 
         # Load expert profile + memory if this is a known expert
@@ -282,7 +325,7 @@ You have full access to tools and skills. Stay focused on the assigned task.
             if memory:
                 parts.append(f"## Your Memory (from previous runs)\n\n{memory}")
 
-        # Load full skills catalog
+        # Load full skills catalog from the main workspace
         skills_loader = SkillsLoader(self.workspace)
 
         always_skills = skills_loader.get_always_skills()
@@ -300,7 +343,8 @@ Read SKILL.md with read_file to use a skill.
 {skills_summary}""")
 
         # Worklog instructions
-        worklog_path = self.expert_library.get_worklog_path(expert_name or "_generic")
+        dir_name = expert_name if (expert_name and self.expert_library.expert_exists(expert_name)) else "_generic"
+        worklog_path = self.expert_library.get_worklog_path(dir_name)
         parts.append(f"""## Work Process Rules (MUST FOLLOW)
 
 You MUST maintain a live work log throughout your task execution.
@@ -338,9 +382,31 @@ What you're doing now...
 
         return "\n\n".join(parts)
 
+    # ── Session persistence ───────────────────────────────────────────────
+
+    def _save_session_turn(
+        self,
+        session: Session,
+        messages: list[dict],
+        skip: int,
+    ) -> None:
+        """Save new-turn messages into the expert's persistent session."""
+        for m in messages[skip:]:
+            entry = dict(m)
+            role, content = entry.get("role"), entry.get("content")
+            if role == "assistant" and not content and not entry.get("tool_calls"):
+                continue
+            if role == "tool" and isinstance(content, str) and len(content) > _TOOL_RESULT_MAX_CHARS:
+                entry["content"] = content[:_TOOL_RESULT_MAX_CHARS] + "\n... (truncated)"
+            entry.setdefault("timestamp", datetime.now().isoformat())
+            session.messages.append(entry)
+        session.updated_at = datetime.now()
+
+    # ── Artifact saving ──────────────────────────────────────────────────
+
     def _save_task_artifacts(
         self,
-        expert_name: str | None,
+        expert_name: str,
         task_id: str,
         task: str,
         label: str,
@@ -349,7 +415,6 @@ What you're doing now...
         status: str,
     ) -> tuple[Path, Path]:
         """Save the detailed result file and finalize worklog. Returns (result_path, worklog_path)."""
-        name = expert_name or f"_task-{task_id}"
         now = datetime.now()
         now_str = now.strftime("%Y-%m-%d %H:%M")
 
@@ -367,21 +432,20 @@ Task ID: {task_id}
 ## Tools Used
 {', '.join(set(tools_used)) if tools_used else 'none'}
 """
-        result_path = self.expert_library.save_result(name, result_content)
+        result_path = self.expert_library.save_result(expert_name, result_content)
 
-        # Append to worklog
-        worklog_path = self.expert_library.get_worklog_path(name)
+        worklog_path = self.expert_library.get_worklog_path(expert_name)
         try:
             existing = worklog_path.read_text(encoding="utf-8") if worklog_path.exists() else ""
             footer = f"\n\n---\nCompleted: {now_str} | Status: {status} | Result: {result_path}\n"
-            self.expert_library.write_worklog(name, existing + footer)
+            self.expert_library.write_worklog(expert_name, existing + footer)
         except OSError:
             pass
 
         return result_path, worklog_path
 
     def _extract_short_summary(self, full_result: str) -> str:
-        """Extract a short summary from the expert's final response (already instructed to be short)."""
+        """Extract a short summary from the expert's final response."""
         lines = full_result.strip().split("\n")
         summary_lines = []
         char_count = 0
@@ -392,37 +456,43 @@ Task ID: {task_id}
             char_count += len(line)
         return "\n".join(summary_lines) if summary_lines else full_result[:300]
 
+    # ── Post-completion ──────────────────────────────────────────────────
+
     async def _post_completion(
         self,
         expert_name: str | None,
+        temp_name: str,
         task: str,
         final_result: str,
         tools_used: list[str],
         status: str,
-    ) -> None:
-        """After task completion: create new expert or update existing one's memory."""
+    ) -> str | None:
+        """After task completion: create new expert or update existing one's memory.
+
+        Returns the created expert name if a new expert was born, else None.
+        """
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
 
         if expert_name and self.expert_library.expert_exists(expert_name):
-            # Existing expert: update usage stats and history
             self.expert_library.record_usage(expert_name)
             self.expert_library.append_expert_history(
                 expert_name,
                 f"[{now_str}] Task: {task[:100]} | Tools: {', '.join(tools_used)} | Status: {status}",
             )
-            # Update expert memory via LLM
             await self._update_expert_memory(expert_name, task, final_result)
+            return None
         else:
-            # New task with no expert: generate a new expert profile via LLM
-            await self._create_expert_from_task(task, final_result, tools_used)
+            created_name = await self._create_expert_from_task(task, final_result, tools_used, temp_name)
+            return created_name
 
     async def _create_expert_from_task(
         self,
         task: str,
         result: str,
         tools_used: list[str],
-    ) -> None:
-        """Use LLM to generate a new expert profile from the completed task."""
+        temp_name: str,
+    ) -> str | None:
+        """Use LLM to generate a new expert profile, then migrate temp data to it."""
         prompt = f"""A task was just completed successfully. Create an expert profile for this type of work.
 
 Task: {task}
@@ -453,7 +523,7 @@ Call the save_expert_profile tool with:
 
             if not response.has_tool_calls:
                 logger.warning("Expert profile creation: LLM did not call save_expert_profile")
-                return
+                return None
 
             args = response.tool_calls[0].arguments
             if isinstance(args, str):
@@ -464,7 +534,7 @@ Call the save_expert_profile tool with:
             name = args.get("expert_name", "").strip()
             if not name:
                 logger.warning("Expert profile creation: empty expert_name")
-                return
+                return None
 
             tags = [t.strip() for t in args.get("tags", "").split(",") if t.strip()]
 
@@ -481,10 +551,53 @@ Call the save_expert_profile tool with:
             if memory_notes:
                 self.expert_library.save_expert_memory(name, memory_notes)
 
+            # Migrate temp workspace, sessions, results to the new expert directory
+            self._migrate_temp_to_expert(temp_name, name)
+
             logger.info("Created new expert from task: {}", name)
+            return name
 
         except Exception:
             logger.exception("Failed to create expert profile from task")
+            return None
+
+    def _migrate_temp_to_expert(self, temp_name: str, expert_name: str) -> None:
+        """Move workspace, sessions, and results from a temp directory to the new expert."""
+        temp_dir = self.expert_library.get_expert_dir(temp_name)
+        expert_dir = self.expert_library.get_expert_dir(expert_name)
+
+        if not temp_dir.exists():
+            return
+
+        for subdir in ("workspace", "sessions", "results"):
+            src = temp_dir / subdir
+            dst = expert_dir / subdir
+            if not src.exists():
+                continue
+            if dst.exists():
+                # Merge: copy individual files
+                for item in src.iterdir():
+                    target = dst / item.name
+                    if not target.exists():
+                        if item.is_dir():
+                            shutil.copytree(str(item), str(target))
+                        else:
+                            shutil.copy2(str(item), str(target))
+            else:
+                shutil.copytree(str(src), str(dst))
+
+        # Copy worklog if it exists
+        temp_worklog = temp_dir / "WORKLOG.md"
+        if temp_worklog.exists():
+            expert_worklog = expert_dir / "WORKLOG.md"
+            if not expert_worklog.exists():
+                shutil.copy2(str(temp_worklog), str(expert_worklog))
+
+        # Clean up temp directory
+        try:
+            shutil.rmtree(str(temp_dir))
+        except OSError:
+            logger.warning("Could not clean up temp expert dir: {}", temp_dir)
 
     async def _update_expert_memory(
         self,
@@ -524,6 +637,8 @@ If nothing new was learned, return the memory unchanged."""
         except Exception:
             logger.exception("Failed to update expert memory for {}", expert_name)
 
+    # ── Announcement ─────────────────────────────────────────────────────
+
     async def _announce_result(
         self,
         task_id: str,
@@ -556,6 +671,8 @@ Relay the summary to the user naturally. Keep it brief (1-2 sentences). Do not m
 
         await self.bus.publish_inbound(msg)
         logger.debug("Expert [{}] announced result to {}:{}", task_id, origin['channel'], origin['chat_id'])
+
+    # ── Cancellation ─────────────────────────────────────────────────────
 
     async def cancel_by_session(self, session_key: str) -> int:
         """Cancel all subagents for the given session. Returns count cancelled."""
