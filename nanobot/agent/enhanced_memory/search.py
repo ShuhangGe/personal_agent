@@ -14,7 +14,7 @@ from loguru import logger
 
 try:
     from whoosh.index import create_in, open_dir, exists_in
-    from whoosh.fields import Schema, TEXT, ID, DATETIME, FLOAT
+    from whoosh.fields import Schema, TEXT, ID, DATETIME, NUMERIC as FLOAT
     from whoosh.qparser import QueryParser, MultifieldParser
     from whoosh.query import And, Or, Term
     import whoosh.scoring as scoring
