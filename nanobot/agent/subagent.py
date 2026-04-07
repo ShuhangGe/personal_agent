@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import shutil
 import uuid
 from datetime import datetime
 from pathlib import Path
+import time
 from typing import Any
 
 from loguru import logger
@@ -62,6 +64,7 @@ _SAVE_EXPERT_TOOL = [
 ]
 
 _TOOL_RESULT_MAX_CHARS = 16_000
+_MAX_EVAL_ROUNDS = 5
 
 
 class SubagentManager:
@@ -138,19 +141,22 @@ class SubagentManager:
         expert_name: str | None = None,
         context: str | None = None,
     ) -> None:
-        """Execute the expert subagent with its own workspace, session, and memory."""
+        """Execute the expert subagent with evaluator review loop."""
         logger.info("Expert [{}] starting task: {}", task_id, label)
         tools_used: list[str] = []
         effective_expert_name = expert_name
+        start_time = time.monotonic()
 
         # Resolve the expert's isolated workspace and session storage.
-        # For known experts, use their permanent directory.
-        # For generic (first-time) experts, use a temp name that will be
-        # migrated after the expert profile is created.
         temp_name = f"_task-{task_id}"
         expert_dir_name = expert_name if (expert_name and self.expert_library.expert_exists(expert_name)) else temp_name
+
+        # Migrate old flat layout if needed
+        if expert_name and self.expert_library.expert_exists(expert_name):
+            self.expert_library._migrate_flat_to_nested(expert_name)
+
         expert_workspace = self.expert_library.get_expert_workspace(expert_dir_name)
-        expert_sessions_dir = self.expert_library.get_expert_sessions_dir(expert_dir_name)
+        evaluator_workspace = self.expert_library.get_evaluator_workspace(expert_dir_name)
 
         try:
             tools = self._build_expert_tools(expert_workspace)
@@ -167,59 +173,98 @@ class SubagentManager:
             if context:
                 user_message = f"Context from conversation:\n{context}\n\nTask:\n{task}"
 
-            messages: list[dict[str, Any]] = [
-                {"role": "system", "content": system_prompt},
-                *history,
-                {"role": "user", "content": user_message},
-            ]
-
-            max_iterations = 25
-            iteration = 0
             final_result: str | None = None
+            verdict = "NOT GOOD"
+            evaluator_feedback = ""
+            eval_round = 0
 
-            while iteration < max_iterations:
-                iteration += 1
+            for eval_round_num in range(1, _MAX_EVAL_ROUNDS + 1):
+                eval_round = eval_round_num
 
-                response = await self.provider.chat_with_retry(
-                    messages=messages,
-                    tools=tools.get_definitions(),
-                    model=self.model,
+                # Build messages for this round
+                if eval_round_num == 1:
+                    round_user_message = user_message
+                else:
+                    round_user_message = (
+                        f"The evaluator reviewed your previous output and found issues.\n\n"
+                        f"## Evaluator Feedback\n{evaluator_feedback}\n\n"
+                        f"## Original Task\n{task}\n\n"
+                        f"Please address the evaluator's feedback and produce an improved output."
+                    )
+
+                messages: list[dict[str, Any]] = [
+                    {"role": "system", "content": system_prompt},
+                    *history,
+                    {"role": "user", "content": round_user_message},
+                ]
+
+                # Run expert LLM loop
+                max_iterations = 25
+                iteration = 0
+
+                while iteration < max_iterations:
+                    iteration += 1
+
+                    response = await self.provider.chat_with_retry(
+                        messages=messages,
+                        tools=tools.get_definitions(),
+                        model=self.model,
+                    )
+
+                    if response.has_tool_calls:
+                        tool_call_dicts = [
+                            tc.to_openai_tool_call() for tc in response.tool_calls
+                        ]
+                        messages.append(build_assistant_message(
+                            response.content or "",
+                            tool_calls=tool_call_dicts,
+                            reasoning_content=response.reasoning_content,
+                            thinking_blocks=response.thinking_blocks,
+                        ))
+
+                        for tool_call in response.tool_calls:
+                            tools_used.append(tool_call.name)
+                            args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
+                            logger.debug("Expert [{}] executing: {}({})", task_id, tool_call.name, args_str[:200])
+                            result = await tools.execute(tool_call.name, tool_call.arguments)
+                            messages.append({
+                                "role": "tool",
+                                "tool_call_id": tool_call.id,
+                                "name": tool_call.name,
+                                "content": result,
+                            })
+                    else:
+                        final_result = response.content
+                        break
+
+                if final_result is None:
+                    final_result = "Task completed but no final response was generated."
+
+                # Run evaluator
+                verdict, evaluator_feedback = await self._run_evaluator(
+                    expert_dir_name=expert_dir_name,
+                    task=task,
+                    expert_output=final_result,
+                    round_num=eval_round_num,
+                    expert_workspace=expert_workspace,
+                    evaluator_workspace=evaluator_workspace,
                 )
 
-                if response.has_tool_calls:
-                    tool_call_dicts = [
-                        tc.to_openai_tool_call() for tc in response.tool_calls
-                    ]
-                    messages.append(build_assistant_message(
-                        response.content or "",
-                        tool_calls=tool_call_dicts,
-                        reasoning_content=response.reasoning_content,
-                        thinking_blocks=response.thinking_blocks,
-                    ))
+                logger.info(
+                    "Expert [{}] eval round {}/{}: verdict={}",
+                    task_id, eval_round_num, _MAX_EVAL_ROUNDS, verdict,
+                )
 
-                    for tool_call in response.tool_calls:
-                        tools_used.append(tool_call.name)
-                        args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
-                        logger.debug("Expert [{}] executing: {}({})", task_id, tool_call.name, args_str[:200])
-                        result = await tools.execute(tool_call.name, tool_call.arguments)
-                        messages.append({
-                            "role": "tool",
-                            "tool_call_id": tool_call.id,
-                            "name": tool_call.name,
-                            "content": result,
-                        })
-                else:
-                    final_result = response.content
+                if verdict == "GOOD":
                     break
 
-            if final_result is None:
-                final_result = "Task completed but no final response was generated."
+            elapsed = time.monotonic() - start_time
 
-            # Save this conversation turn into the expert's persistent session
+            # Save session
             self._save_session_turn(session, messages, 1 + len(history))
             expert_session_mgr.save(session)
 
-            # Save detailed result to file
+            # Save result with evaluation metrics
             result_path, worklog_path = self._save_task_artifacts(
                 expert_name=expert_dir_name,
                 task_id=task_id,
@@ -228,6 +273,9 @@ class SubagentManager:
                 final_result=final_result,
                 tools_used=tools_used,
                 status="success",
+                eval_verdict=verdict,
+                eval_rounds=eval_round,
+                elapsed_seconds=elapsed,
             )
 
             # Post-completion: create/update expert profile and memory
@@ -238,20 +286,26 @@ class SubagentManager:
                 final_result=final_result,
                 tools_used=list(set(tools_used)),
                 status="success",
+                eval_verdict=verdict,
+                eval_rounds=eval_round,
             )
 
-            short_summary = self._extract_short_summary(final_result)
-            logger.info("Expert [{}] completed successfully", task_id)
-
-            # If a new expert was created from a temp task, update paths for the announcement
+            # If a new expert was created from a temp task, update paths
             if created_name and created_name != expert_dir_name:
                 new_results = self.expert_library.list_results(created_name)
                 if new_results:
                     result_path = new_results[0]
                 worklog_path = self.expert_library.get_worklog_path(created_name)
 
+            logger.info(
+                "Expert [{}] done: verdict={}, rounds={}, {:.0f}s",
+                task_id, verdict, eval_round, elapsed,
+            )
+
             await self._announce_result(
-                task_id, label, task, short_summary, result_path, worklog_path, origin, "ok"
+                task_id, label, task, result_path, worklog_path, origin,
+                verdict=verdict, eval_rounds=eval_round, elapsed_seconds=elapsed,
+                evaluator_feedback=evaluator_feedback,
             )
 
         except Exception as e:
@@ -269,7 +323,8 @@ class SubagentManager:
             )
 
             await self._announce_result(
-                task_id, label, task, error_msg, result_path, worklog_path, origin, "error"
+                task_id, label, task, result_path, worklog_path, origin,
+                verdict="ERROR", eval_rounds=0, elapsed_seconds=time.monotonic() - start_time,
             )
 
     # ── Tool and prompt building ──────────────────────────────────────────
@@ -393,7 +448,225 @@ What you're doing now...
 
         return "\n\n".join(parts)
 
-    # ── Session persistence ───────────────────────────────────────────────
+    # ── Evaluator methods ────────────────────────────────────────────────
+
+    async def _run_evaluator(
+        self,
+        expert_dir_name: str,
+        task: str,
+        expert_output: str,
+        round_num: int,
+        expert_workspace: Path,
+        evaluator_workspace: Path,
+    ) -> tuple[str, str]:
+        """Run the evaluator to review expert output.
+
+        Returns (verdict, feedback) where verdict is "GOOD" or "NOT GOOD".
+        """
+        eval_tools = self._build_evaluator_tools(expert_workspace, evaluator_workspace)
+        eval_prompt = self._build_evaluator_prompt(
+            expert_dir_name, expert_workspace, evaluator_workspace,
+        )
+
+        # Load evaluator session
+        eval_session_mgr = SessionManager(
+            self.expert_library.get_expert_dir(expert_dir_name)
+        )
+        eval_session = eval_session_mgr.get_or_create("evaluator")
+        eval_history = eval_session.get_history(max_messages=0)
+
+        user_msg = (
+            f"## Task (Round {round_num})\n{task}\n\n"
+            f"## Expert Output to Review\n{expert_output}\n\n"
+            f"Review the expert's output above. Check if it fully addresses the task.\n"
+            f"Provide your verdict with specific feedback."
+        )
+
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": eval_prompt},
+            *eval_history,
+            {"role": "user", "content": user_msg},
+        ]
+
+        max_iterations = 10
+        iteration = 0
+        eval_result: str | None = None
+
+        while iteration < max_iterations:
+            iteration += 1
+
+            response = await self.provider.chat_with_retry(
+                messages=messages,
+                tools=eval_tools.get_definitions(),
+                model=self.model,
+            )
+
+            if response.has_tool_calls:
+                tool_call_dicts = [
+                    tc.to_openai_tool_call() for tc in response.tool_calls
+                ]
+                messages.append(build_assistant_message(
+                    response.content or "",
+                    tool_calls=tool_call_dicts,
+                    reasoning_content=response.reasoning_content,
+                    thinking_blocks=response.thinking_blocks,
+                ))
+
+                for tool_call in response.tool_calls:
+                    result = await eval_tools.execute(tool_call.name, tool_call.arguments)
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "name": tool_call.name,
+                        "content": result,
+                    })
+            else:
+                eval_result = response.content
+                break
+
+        if eval_result is None:
+            eval_result = "No evaluation response generated."
+
+        # Save evaluator session turn
+        self._save_session_turn(eval_session, messages, 1 + len(eval_history))
+        eval_session_mgr.save(eval_session)
+
+        verdict, feedback = self._parse_evaluator_verdict(eval_result)
+        return verdict, feedback
+
+    def _build_evaluator_tools(
+        self,
+        expert_workspace: Path,
+        evaluator_workspace: Path,
+    ) -> ToolRegistry:
+        """Build tools for the evaluator — can read expert workspace, write to own workspace."""
+        tools = ToolRegistry()
+        # ReadFile and ListDir can read from both evaluator workspace and expert workspace (read-only)
+        for cls in (ReadFileTool, ListDirTool):
+            tools.register(cls(
+                workspace=evaluator_workspace,
+                allowed_dir=evaluator_workspace,
+                read_only_dirs=[expert_workspace],
+            ))
+        # Write and Edit restricted to evaluator workspace only
+        for cls in (WriteFileTool, EditFileTool):
+            tools.register(cls(workspace=evaluator_workspace, allowed_dir=evaluator_workspace))
+        tools.register(ExecTool(
+            working_dir=str(evaluator_workspace),
+            timeout=self.exec_config.timeout,
+            restrict_to_workspace=True,
+            path_append=self.exec_config.path_append,
+        ))
+        tools.register(WebSearchTool(config=self.web_search_config, proxy=self.web_proxy))
+        tools.register(WebFetchTool(proxy=self.web_proxy))
+        return tools
+
+    def _build_evaluator_prompt(
+        self,
+        expert_dir_name: str,
+        expert_workspace: Path,
+        evaluator_workspace: Path,
+    ) -> str:
+        """Build the evaluator's system prompt."""
+        from nanobot.agent.context import ContextBuilder
+
+        time_ctx = ContextBuilder._build_runtime_context(None, None)
+
+        parts = [f"""# Evaluator Agent
+
+{time_ctx}
+
+You are an evaluator agent. Your job is to critically review the output produced by the expert agent.
+You must assess whether the output correctly and completely fulfills the assigned task.
+
+## Expert Workspace (READ-ONLY)
+{expert_workspace}
+
+You can read files from the expert's workspace to verify their work, but you CANNOT modify anything there.
+
+## Your Workspace (READ-WRITE)
+{evaluator_workspace}
+
+This is your own workspace for writing notes or analysis files.
+"""]
+
+        # Load evaluator soul, memory, experience if expert exists
+        expert_name = None
+        # Extract the actual expert name (strip _task- prefix for temp dirs)
+        if not expert_dir_name.startswith("_task-"):
+            expert_name = expert_dir_name
+
+        if expert_name and self.expert_library.expert_exists(expert_name):
+            soul = self.expert_library.load_evaluator_soul(expert_name)
+            if soul:
+                parts.append(f"## Your Identity (Soul)\n\n{soul}")
+
+            memory = self.expert_library.load_evaluator_memory(expert_name)
+            if memory:
+                parts.append(f"## Your Memory\n\n{memory}")
+
+            experience = self.expert_library.load_evaluator_experience(expert_name)
+            if experience:
+                parts.append(f"## Your Experience\n\n{experience}")
+
+        parts.append("""## Review Instructions
+
+1. Read the task description carefully
+2. Review the expert's output thoroughly
+3. If needed, read files from the expert's workspace to verify claims
+4. Assess correctness, completeness, edge cases, and overall quality
+5. Provide your review with specific feedback
+6. End with your verdict using the required format:
+
+---VERDICT---
+Status: GOOD
+---END VERDICT---
+
+OR:
+
+---VERDICT---
+Status: NOT GOOD
+Issues: [comma-separated list of specific issues]
+---END VERDICT---
+""")
+
+        return "\n\n".join(parts)
+
+    @staticmethod
+    def _parse_evaluator_verdict(response: str) -> tuple[str, str]:
+        """Parse verdict and feedback from evaluator response.
+
+        Returns (verdict, feedback) where verdict is "GOOD" or "NOT GOOD".
+        """
+        # Extract verdict block
+        verdict_match = re.search(
+            r"---VERDICT---\s*Status:\s*(GOOD|NOT GOOD)\s*(?:Issues:\s*(.+?))?\s*---END VERDICT---",
+            response,
+            re.DOTALL | re.IGNORECASE,
+        )
+
+        if verdict_match:
+            verdict = verdict_match.group(1).upper()
+            issues = verdict_match.group(2)
+        else:
+            # Fallback: look for any GOOD/NOT GOOD in the response
+            if re.search(r"\bGOOD\b", response, re.IGNORECASE):
+                verdict = "GOOD"
+            else:
+                verdict = "NOT GOOD"
+            issues = None
+
+        # Feedback is the full response minus the verdict block
+        feedback = response
+        if verdict_match:
+            feedback = response[:verdict_match.start()] + response[verdict_match.end():]
+        feedback = feedback.strip()
+
+        # If verdict is NOT GOOD and issues were provided, include them
+        if verdict == "NOT GOOD" and issues:
+            feedback = f"Issues: {issues.strip()}\n\n{feedback}"
+
+        return verdict, feedback
 
     def _save_session_turn(
         self,
@@ -424,16 +697,28 @@ What you're doing now...
         final_result: str,
         tools_used: list[str],
         status: str,
+        eval_verdict: str = "",
+        eval_rounds: int = 0,
+        elapsed_seconds: float = 0.0,
     ) -> tuple[Path, Path]:
         """Save the detailed result file and finalize worklog. Returns (result_path, worklog_path)."""
         now = datetime.now()
         now_str = now.strftime("%Y-%m-%d %H:%M")
 
+        eval_metrics = ""
+        if eval_verdict:
+            eval_metrics = f"""
+## Evaluation
+Verdict: {eval_verdict}
+Rounds: {eval_rounds}
+Time: {elapsed_seconds:.1f}s
+"""
+
         result_content = f"""# Result: {label}
 Completed: {now_str}
 Status: {status}
 Task ID: {task_id}
-
+{eval_metrics}
 ## Task
 {task}
 
@@ -477,9 +762,12 @@ Task ID: {task_id}
         final_result: str,
         tools_used: list[str],
         status: str,
+        eval_verdict: str = "",
+        eval_rounds: int = 0,
     ) -> str | None:
         """After task completion: create new expert or update existing one's memory.
 
+        Also updates evaluator memory for existing experts.
         Returns the created expert name if a new expert was born, else None.
         """
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -488,11 +776,12 @@ Task ID: {task_id}
             self.expert_library.record_usage(expert_name)
             self.expert_library.append_expert_history(
                 expert_name,
-                f"[{now_str}] Task: {task[:100]} | Tools: {', '.join(tools_used)} | Status: {status}",
+                f"[{now_str}] Task: {task[:100]} | Tools: {', '.join(tools_used)} | Status: {status} | Eval: {eval_verdict} ({eval_rounds} rounds)",
             )
             await self._update_expert_memory(expert_name, task, final_result)
-            # Save learned experience
             await self._update_expert_experience(expert_name, task, final_result, status)
+            # Update evaluator memory too
+            await self._update_evaluator_memory(expert_name, task, final_result, eval_verdict, eval_rounds)
             return None
         else:
             created_name = await self._create_expert_from_task(task, final_result, tools_used, temp_name)
@@ -582,13 +871,13 @@ Call the save_expert_profile tool with:
         if not temp_dir.exists():
             return
 
-        for subdir in ("workspace", "sessions", "results"):
+        # Migrate expert subdirs (temp was created with nested layout)
+        for subdir in ("expert/workspace", "expert/sessions", "expert/memory"):
             src = temp_dir / subdir
             dst = expert_dir / subdir
             if not src.exists():
                 continue
             if dst.exists():
-                # Merge: copy individual files
                 for item in src.iterdir():
                     target = dst / item.name
                     if not target.exists():
@@ -596,6 +885,20 @@ Call the save_expert_profile tool with:
                             shutil.copytree(str(item), str(target))
                         else:
                             shutil.copy2(str(item), str(target))
+            else:
+                shutil.copytree(str(src), str(dst))
+
+        # Migrate results (top-level)
+        for subdir in ("results",):
+            src = temp_dir / subdir
+            dst = expert_dir / subdir
+            if not src.exists():
+                continue
+            if dst.exists():
+                for item in src.iterdir():
+                    target = dst / item.name
+                    if not target.exists():
+                        shutil.copy2(str(item), str(target))
             else:
                 shutil.copytree(str(src), str(dst))
 
@@ -702,6 +1005,59 @@ Format your response as a brief paragraph that can be appended to an experience 
         except Exception:
             logger.exception("Failed to update expert experience for {}", expert_name)
 
+    async def _update_evaluator_memory(
+        self,
+        expert_name: str,
+        task: str,
+        result: str,
+        verdict: str,
+        eval_rounds: int,
+    ) -> None:
+        """Update evaluator memory with evaluation learnings."""
+        now_str = datetime.now().strftime("%Y-%m-%d")
+
+        prompt = f"""Update the evaluator's memory with insights from this evaluation.
+
+## Current Evaluator Memory
+{self.expert_library.load_evaluator_memory(expert_name) or "(empty)"}
+
+## Task Evaluated
+{task}
+
+## Expert Output
+{result[:500]}
+
+## Evaluation Result
+Verdict: {verdict}
+Rounds: {eval_rounds}
+
+What patterns or insights should the evaluator remember for future reviews?
+Return the updated memory as markdown."""
+
+        messages = [
+            {"role": "system", "content": "You update an evaluator's persistent memory. Return only the updated memory content."},
+            {"role": "user", "content": prompt},
+        ]
+
+        try:
+            response = await self.provider.chat_with_retry(
+                messages=messages, tools=[], model=self.model,
+            )
+            if response.content and response.content.strip():
+                self.expert_library.save_evaluator_memory(expert_name, response.content.strip())
+                # Also append experience
+                experience_entry = f"""## {now_str}
+
+### Task: {task[:80]}...
+**Verdict:** {verdict} after {eval_rounds} round(s)
+
+---
+"""
+                self.expert_library.append_evaluator_experience(expert_name, experience_entry)
+                logger.debug("Updated evaluator memory for expert: {}", expert_name)
+        except Exception:
+            logger.exception("Failed to update evaluator memory for {}", expert_name)
+
     # ── Announcement ─────────────────────────────────────────────────────
 
     async def _announce_result(
@@ -709,24 +1065,36 @@ Format your response as a brief paragraph that can be appended to an experience 
         task_id: str,
         label: str,
         task: str,
-        short_summary: str,
         result_path: Path,
         worklog_path: Path,
         origin: dict[str, str],
-        status: str,
+        verdict: str = "GOOD",
+        eval_rounds: int = 1,
+        elapsed_seconds: float = 0.0,
+        evaluator_feedback: str = "",
     ) -> None:
         """Announce the expert's result to the orchestrator via the message bus."""
-        status_text = "completed successfully" if status == "ok" else "failed"
-
-        announce_content = f"""[Expert '{label}' {status_text}]
-
-Summary: {short_summary}
+        if verdict == "ERROR":
+            status_text = "failed"
+            announce_content = f"""[Expert '{label}' {status_text}]
 
 Full result: {result_path}
-Work log: {worklog_path}
 
-Relay the summary to the user naturally. Keep it brief (1-2 sentences). Do not mention expert IDs or technical internals."""
+Relay the error to the user naturally. Keep it brief."""
+        elif verdict == "GOOD":
+            announce_content = f"""Expert '{label}' done. GOOD, {eval_rounds} round{"s" if eval_rounds != 1 else ""}, {elapsed_seconds:.0f}s. Result saved: {result_path}
 
+Relay this to the user naturally. Keep it brief (1-2 sentences). Do not mention expert IDs or technical internals."""
+        else:
+            # NOT GOOD after max rounds
+            issues_summary = ""
+            if evaluator_feedback:
+                # Take first 200 chars of feedback as issues summary
+                issues_summary = evaluator_feedback[:200]
+            announce_content = f"""Expert '{label}' done. NOT GOOD after {eval_rounds} rounds, {elapsed_seconds:.0f}s. Issues: {issues_summary}
+
+Full result: {result_path}
+Relay this to the user naturally. Include the key issues found. Keep it brief."""
         msg = InboundMessage(
             channel="system",
             sender_id="expert",

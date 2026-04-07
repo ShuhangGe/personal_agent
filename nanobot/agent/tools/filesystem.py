@@ -26,12 +26,45 @@ def _resolve_path(
 class _FsTool(Tool):
     """Shared base for filesystem tools — common init and path resolution."""
 
-    def __init__(self, workspace: Path | None = None, allowed_dir: Path | None = None):
+    def __init__(
+        self,
+        workspace: Path | None = None,
+        allowed_dir: Path | None = None,
+        read_only_dirs: list[Path] | None = None,
+    ):
         self._workspace = workspace
         self._allowed_dir = allowed_dir
+        self._read_only_dirs = read_only_dirs or []
 
     def _resolve(self, path: str) -> Path:
         return _resolve_path(path, self._workspace, self._allowed_dir)
+
+    def _resolve_readonly(self, path: str) -> Path:
+        """Resolve path for read access — checks allowed_dir then read_only_dirs."""
+        p = Path(path).expanduser()
+        if not p.is_absolute() and self._workspace:
+            p = self._workspace / p
+        resolved = p.resolve()
+        # Check writeable dir first
+        if self._allowed_dir:
+            try:
+                resolved.relative_to(self._allowed_dir.resolve())
+                return resolved
+            except ValueError:
+                pass
+        # Check read-only dirs
+        for ro_dir in self._read_only_dirs:
+            try:
+                resolved.relative_to(ro_dir.resolve())
+                return resolved
+            except ValueError:
+                pass
+        # If no restriction dirs set, allow any path
+        if not self._allowed_dir and not self._read_only_dirs:
+            return resolved
+        raise PermissionError(
+            f"Path {path} is outside allowed directories"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -77,7 +110,7 @@ class ReadFileTool(_FsTool):
 
     async def execute(self, path: str, offset: int = 1, limit: int | None = None, **kwargs: Any) -> str:
         try:
-            fp = self._resolve(path)
+            fp = self._resolve_readonly(path)
             if not fp.exists():
                 return f"Error: File not found: {path}"
             if not fp.is_file():
@@ -325,7 +358,7 @@ class ListDirTool(_FsTool):
         max_entries: int | None = None, **kwargs: Any,
     ) -> str:
         try:
-            dp = self._resolve(path)
+            dp = self._resolve_readonly(path)
             if not dp.exists():
                 return f"Error: Directory not found: {path}"
             if not dp.is_dir():

@@ -19,15 +19,18 @@ class ExpertLibrary:
         experts/{name}/
             EXPERT.md           # Profile: description, approach, tags
             WORKLOG.md          # Live work log (plan + progress, updated during execution)
-            memory/
-                MEMORY.md       # Persistent knowledge across runs
-                HISTORY.md      # Grep-searchable task log
-                SOUL.md         # Expert's identity and personality
-                EXPERIENCE.md   # Lessons learned from previous runs
             results/
                 {timestamp}.md  # Detailed result files
-            workspace/          # Expert's isolated file sandbox
-            sessions/           # Persistent conversation history across runs
+            expert/
+                workspace/      # Expert's isolated file sandbox
+                sessions/       # Persistent conversation history
+                memory/
+                    MEMORY.md, SOUL.md, EXPERIENCE.md, HISTORY.md
+            evaluator/
+                workspace/      # Evaluator's isolated file sandbox
+                sessions/       # Evaluator conversation history
+                memory/
+                    MEMORY.md, SOUL.md, EXPERIENCE.md
     """
 
     def __init__(self, workspace: Path):
@@ -68,11 +71,11 @@ class ExpertLibrary:
 
     def get_expert_workspace(self, name: str) -> Path:
         """Return the expert's isolated workspace directory, creating it if needed."""
-        return ensure_dir(self.get_expert_dir(name) / "workspace")
+        return ensure_dir(self.get_expert_dir(name) / "expert" / "workspace")
 
     def get_expert_sessions_dir(self, name: str) -> Path:
         """Return the expert's sessions directory, creating it if needed."""
-        return ensure_dir(self.get_expert_dir(name) / "sessions")
+        return ensure_dir(self.get_expert_dir(name) / "expert" / "sessions")
 
     def list_experts(self) -> list[dict]:
         """List all experts with their registry metadata."""
@@ -101,7 +104,158 @@ class ExpertLibrary:
     # ── Per-expert memory ────────────────────────────────────────────────
 
     def _memory_dir(self, name: str) -> Path:
-        return ensure_dir(self.get_expert_dir(name) / "memory")
+        return ensure_dir(self.get_expert_dir(name) / "expert" / "memory")
+
+    # ── Evaluator directory helpers ─────────────────────────────────────
+
+    def get_evaluator_workspace(self, name: str) -> Path:
+        """Return the evaluator's isolated workspace directory, creating it if needed."""
+        return ensure_dir(self.get_expert_dir(name) / "evaluator" / "workspace")
+
+    def get_evaluator_sessions_dir(self, name: str) -> Path:
+        """Return the evaluator's sessions directory, creating it if needed."""
+        return ensure_dir(self.get_expert_dir(name) / "evaluator" / "sessions")
+
+    def _evaluator_memory_dir(self, name: str) -> Path:
+        return ensure_dir(self.get_expert_dir(name) / "evaluator" / "memory")
+
+    # ── Evaluator memory ────────────────────────────────────────────────
+
+    def load_evaluator_memory(self, name: str) -> str:
+        path = self._evaluator_memory_dir(name) / "MEMORY.md"
+        if path.exists():
+            return path.read_text(encoding="utf-8")
+        return ""
+
+    def save_evaluator_memory(self, name: str, content: str) -> None:
+        (self._evaluator_memory_dir(name) / "MEMORY.md").write_text(content, encoding="utf-8")
+
+    def load_evaluator_soul(self, name: str) -> str:
+        path = self._evaluator_memory_dir(name) / "SOUL.md"
+        if path.exists():
+            return path.read_text(encoding="utf-8")
+        return ""
+
+    def save_evaluator_soul(self, name: str, content: str) -> None:
+        (self._evaluator_memory_dir(name) / "SOUL.md").write_text(content, encoding="utf-8")
+
+    def init_evaluator_soul(self, name: str) -> None:
+        """Initialize a default soul for the evaluator — critical reviewer persona."""
+        soul_content = f"""# {name} Evaluator Identity
+
+## Personality
+- I am a thorough and critical reviewer
+- I focus on correctness, completeness, and edge cases
+- I do not accept mediocre work — I push for excellence
+- I am specific about what needs improvement
+
+## Review Criteria
+- **Correctness**: Does the output accomplish the stated task without errors?
+- **Completeness**: Are all aspects of the task addressed? Nothing missing?
+- **Edge Cases**: Were potential edge cases considered and handled?
+- **Clarity**: Is the output clear and well-structured?
+- **Quality**: Is the work of high professional quality?
+
+## Communication Style
+- Direct and constructive
+- Specific about issues found
+- Acknowledge good work when present
+- Always end with a clear verdict
+
+## Verdict Rules
+After reviewing, I MUST include a verdict block in my response:
+
+---VERDICT---
+Status: GOOD
+---END VERDICT---
+
+OR:
+
+---VERDICT---
+Status: NOT GOOD
+Issues: [comma-separated list of issues]
+---END VERDICT---
+
+I use "GOOD" only when the output meets all criteria.
+I use "NOT GOOD" with specific feedback when improvements are needed.
+"""
+        self.save_evaluator_soul(name, soul_content)
+
+    def load_evaluator_experience(self, name: str) -> str:
+        path = self._evaluator_memory_dir(name) / "EXPERIENCE.md"
+        if path.exists():
+            return path.read_text(encoding="utf-8")
+        return ""
+
+    def save_evaluator_experience(self, name: str, content: str) -> None:
+        (self._evaluator_memory_dir(name) / "EXPERIENCE.md").write_text(content, encoding="utf-8")
+
+    def append_evaluator_experience(self, name: str, entry: str) -> None:
+        path = self._evaluator_memory_dir(name) / "EXPERIENCE.md"
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(entry.rstrip() + "\n\n")
+
+    def init_evaluator_experience(self, name: str) -> None:
+        experience_content = """# Learned Experience (Evaluator)
+
+This file contains lessons learned from evaluating expert outputs.
+
+---
+"""
+        self.save_evaluator_experience(name, experience_content)
+
+    # ── Migration ────────────────────────────────────────────────────────
+
+    def _migrate_flat_to_nested(self, name: str) -> None:
+        """Migrate old flat layout to nested expert/evaluator layout.
+
+        Old: experts/{name}/workspace/, experts/{name}/memory/, experts/{name}/sessions/
+        New: experts/{name}/expert/workspace/, experts/{name}/expert/memory/, etc.
+            + experts/{name}/evaluator/workspace/, experts/{name}/evaluator/memory/, etc.
+        """
+        expert_dir = self.get_expert_dir(name)
+        if not expert_dir.exists():
+            return
+
+        # Only migrate if old flat layout exists and new layout doesn't
+        old_workspace = expert_dir / "workspace"
+        old_memory = expert_dir / "memory"
+        old_sessions = expert_dir / "sessions"
+
+        new_expert_workspace = expert_dir / "expert" / "workspace"
+        new_expert_memory = expert_dir / "expert" / "memory"
+        new_expert_sessions = expert_dir / "expert" / "sessions"
+
+        # Skip if already migrated
+        if new_expert_workspace.exists():
+            return
+
+        import shutil
+
+        # Move workspace → expert/workspace
+        if old_workspace.exists():
+            shutil.move(str(old_workspace), str(new_expert_workspace))
+
+        # Move memory → expert/memory
+        if old_memory.exists():
+            shutil.move(str(old_memory), str(new_expert_memory))
+
+        # Move sessions → expert/sessions
+        if old_sessions.exists():
+            shutil.move(str(old_sessions), str(new_expert_sessions))
+
+        # Create evaluator subdirs with initialized files
+        self._init_evaluator_dirs(name)
+
+        logger.info("Migrated expert '{}' from flat to nested layout", name)
+
+    def _init_evaluator_dirs(self, name: str) -> None:
+        """Create and initialize evaluator subdirectories and memory files."""
+        ensure_dir(self.get_evaluator_workspace(name))
+        ensure_dir(self.get_evaluator_sessions_dir(name))
+        ensure_dir(self._evaluator_memory_dir(name))
+        self.init_evaluator_soul(name)
+        self.init_evaluator_experience(name)
 
     def load_expert_memory(self, name: str) -> str:
         path = self._memory_dir(name) / "MEMORY.md"
@@ -291,8 +445,11 @@ This file contains lessons learned from previous task executions.
         self.init_expert_experience(name)
 
         ensure_dir(self.get_expert_dir(name) / "results")
-        ensure_dir(self.get_expert_dir(name) / "workspace")
-        ensure_dir(self.get_expert_dir(name) / "sessions")
+        ensure_dir(self.get_expert_dir(name) / "expert" / "workspace")
+        ensure_dir(self.get_expert_dir(name) / "expert" / "sessions")
+
+        # Initialize evaluator dirs
+        self._init_evaluator_dirs(name)
 
         self.update_registry_entry(
             name,
