@@ -321,9 +321,20 @@ Use relative paths when possible — they resolve against your workspace.
             if profile:
                 parts.append(f"## Your Expert Profile\n\n{profile}")
 
+            # Load soul (identity/personality)
+            soul = self.expert_library.load_expert_soul(expert_name)
+            if soul:
+                parts.append(f"## Your Identity (Soul)\n\n{soul}")
+
+            # Load memory (what works/doesn't work)
             memory = self.expert_library.load_expert_memory(expert_name)
             if memory:
-                parts.append(f"## Your Memory (from previous runs)\n\n{memory}")
+                parts.append(f"## Your Memory (What Works)\n\n{memory}")
+
+            # Load experience (lessons learned)
+            experience = self.expert_library.load_expert_experience(expert_name)
+            if experience:
+                parts.append(f"## Your Experience (Lessons Learned)\n\n{experience}")
 
         # Load full skills catalog from the main workspace
         skills_loader = SkillsLoader(self.workspace)
@@ -480,6 +491,8 @@ Task ID: {task_id}
                 f"[{now_str}] Task: {task[:100]} | Tools: {', '.join(tools_used)} | Status: {status}",
             )
             await self._update_expert_memory(expert_name, task, final_result)
+            # Save learned experience
+            await self._update_expert_experience(expert_name, task, final_result, status)
             return None
         else:
             created_name = await self._create_expert_from_task(task, final_result, tools_used, temp_name)
@@ -636,6 +649,58 @@ If nothing new was learned, return the memory unchanged."""
                 logger.debug("Updated memory for expert: {}", expert_name)
         except Exception:
             logger.exception("Failed to update expert memory for {}", expert_name)
+
+    async def _update_expert_experience(
+        self,
+        expert_name: str,
+        task: str,
+        result: str,
+        status: str,
+    ) -> None:
+        """Use LLM to extract and save lessons learned from this task execution."""
+        now_str = datetime.now().strftime("%Y-%m-%d")
+
+        prompt = f"""Extract lessons learned from this task execution.
+
+## Task
+{task}
+
+## Result
+{result[:800]}
+
+## Status
+{status}
+
+Provide a concise lesson learned (2-3 sentences max) that would help in future similar tasks.
+Focus on:
+- What worked well
+- What could be improved
+- Key insights or patterns discovered
+
+Format your response as a brief paragraph that can be appended to an experience log."""
+
+        messages = [
+            {"role": "system", "content": "You extract concise lessons learned from task executions. Be brief and actionable."},
+            {"role": "user", "content": prompt},
+        ]
+
+        try:
+            response = await self.provider.chat_with_retry(
+                messages=messages, tools=[], model=self.model,
+            )
+            if response.content and response.content.strip():
+                experience_entry = f"""## {now_str}
+
+### Task: {task[:80]}...
+
+**What Happened:** {response.content.strip()}
+
+---
+"""
+                self.expert_library.append_expert_experience(expert_name, experience_entry)
+                logger.debug("Updated experience for expert: {}", expert_name)
+        except Exception:
+            logger.exception("Failed to update expert experience for {}", expert_name)
 
     # ── Announcement ─────────────────────────────────────────────────────
 

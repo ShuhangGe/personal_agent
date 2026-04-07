@@ -15,6 +15,7 @@ from loguru import logger
 
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.memory import MemoryConsolidator
+from nanobot.agent.enhanced_memory import EnhancedMemoryConsolidator
 from nanobot.agent.subagent import SubagentManager
 from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.tools.message import MessageTool
@@ -76,6 +77,7 @@ class AgentLoop:
         self.cron_service = cron_service
         self.restrict_to_workspace = restrict_to_workspace
 
+        # Initialize context builder (will be updated with enhanced memory later)
         self.context = ContextBuilder(workspace)
         self.sessions = session_manager or SessionManager(workspace)
         self.tools = ToolRegistry()
@@ -97,7 +99,9 @@ class AgentLoop:
         self._mcp_connecting = False
         self._active_tasks: dict[str, list[asyncio.Task]] = {}  # session_key -> tasks
         self._processing_lock = asyncio.Lock()
-        self.memory_consolidator = MemoryConsolidator(
+
+        # Use enhanced memory with Ollama embeddings by default
+        self.memory_consolidator = EnhancedMemoryConsolidator(
             workspace=workspace,
             provider=provider,
             model=self.model,
@@ -105,7 +109,15 @@ class AgentLoop:
             context_window_tokens=context_window_tokens,
             build_messages=self.context.build_messages,
             get_tool_definitions=self.tools.get_definitions,
+            enable_vector_indexing=True,
+            embedding_provider_type="ollama",
+            embedding_model="qwen3-embedding:0.6b",
         )
+
+        # Update context builder with enhanced memory reference
+        self.context.enhanced_memory = self.memory_consolidator
+
+        self._enhanced_memory_initialized = False
         self._register_default_tools()
 
     def _register_default_tools(self) -> None:
@@ -242,6 +254,26 @@ class AgentLoop:
     async def run(self) -> None:
         """Run the agent loop, dispatching messages as tasks to stay responsive to /stop."""
         self._running = True
+
+        # Initialize enhanced memory system if not already done
+        if not self._enhanced_memory_initialized and isinstance(self.memory_consolidator, EnhancedMemoryConsolidator):
+            try:
+                await self.memory_consolidator.initialize()
+                self._enhanced_memory_initialized = True
+                logger.info("Enhanced memory system initialized with Ollama embeddings")
+            except Exception as e:
+                logger.warning(f"Failed to initialize enhanced memory, falling back to basic memory: {e}")
+                # Fall back to basic memory consolidator
+                self.memory_consolidator = MemoryConsolidator(
+                    workspace=self.workspace,
+                    provider=self.provider,
+                    model=self.model,
+                    sessions=self.sessions,
+                    context_window_tokens=self.context_window_tokens,
+                    build_messages=self.context.build_messages,
+                    get_tool_definitions=self.tools.get_definitions,
+                )
+
         await self._connect_mcp()
         logger.info("Agent loop started")
 

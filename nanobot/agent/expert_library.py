@@ -22,6 +22,8 @@ class ExpertLibrary:
             memory/
                 MEMORY.md       # Persistent knowledge across runs
                 HISTORY.md      # Grep-searchable task log
+                SOUL.md         # Expert's identity and personality
+                EXPERIENCE.md   # Lessons learned from previous runs
             results/
                 {timestamp}.md  # Detailed result files
             workspace/          # Expert's isolated file sandbox
@@ -115,6 +117,73 @@ class ExpertLibrary:
         with open(path, "a", encoding="utf-8") as f:
             f.write(entry.rstrip() + "\n\n")
 
+    # ── Per-expert soul (identity/personality) ─────────────────────────────
+
+    def load_expert_soul(self, name: str) -> str:
+        """Load the expert's soul (identity and personality)."""
+        path = self._memory_dir(name) / "SOUL.md"
+        if path.exists():
+            return path.read_text(encoding="utf-8")
+        return ""
+
+    def save_expert_soul(self, name: str, content: str) -> None:
+        """Save the expert's soul (identity and personality)."""
+        (self._memory_dir(name) / "SOUL.md").write_text(content, encoding="utf-8")
+
+    def init_expert_soul(self, name: str) -> None:
+        """Initialize a default soul for a new expert."""
+        soul_content = f"""# {name} Identity
+
+## Personality
+- I am methodical and detail-oriented
+- I prefer structured outputs
+- I focus on actionable insights, not just observations
+
+## Expertise
+- Specialized in tasks matching my tags
+- Continuously learning from each task execution
+
+## Constraints
+- Stay focused on the assigned task
+- Provide clear, actionable results
+- Communicate progress through the work log
+
+## Communication Style
+- Concise and clear
+- Results-oriented
+- Transparent about challenges and solutions
+"""
+        self.save_expert_soul(name, soul_content)
+
+    # ── Per-expert experience (lessons learned) ────────────────────────────
+
+    def load_expert_experience(self, name: str) -> str:
+        """Load the expert's experience (lessons learned from previous runs)."""
+        path = self._memory_dir(name) / "EXPERIENCE.md"
+        if path.exists():
+            return path.read_text(encoding="utf-8")
+        return ""
+
+    def save_expert_experience(self, name: str, content: str) -> None:
+        """Save the expert's experience (lessons learned)."""
+        (self._memory_dir(name) / "EXPERIENCE.md").write_text(content, encoding="utf-8")
+
+    def append_expert_experience(self, name: str, entry: str) -> None:
+        """Append a new experience entry to the expert's experience file."""
+        path = self._memory_dir(name) / "EXPERIENCE.md"
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(entry.rstrip() + "\n\n")
+
+    def init_expert_experience(self, name: str) -> None:
+        """Initialize an empty experience file for a new expert."""
+        experience_content = """# Learned Experience
+
+This file contains lessons learned from previous task executions.
+
+---
+"""
+        self.save_expert_experience(name, experience_content)
+
     # ── Worklog ──────────────────────────────────────────────────────────
 
     def write_worklog(self, name: str, content: str) -> Path:
@@ -188,7 +257,7 @@ class ExpertLibrary:
         tools_used: list[str] | None = None,
         skills_used: list[str] | None = None,
     ) -> None:
-        """Create a new expert with profile, empty memory, and registry entry."""
+        """Create a new expert with profile, empty memory, soul, experience, and registry entry."""
         now = datetime.now()
         now_str = now.strftime("%Y-%m-%d %H:%M")
 
@@ -208,6 +277,7 @@ class ExpertLibrary:
 """
         self.save_expert_profile(name, profile)
 
+        # Initialize memory files
         ensure_dir(self._memory_dir(name))
         mem_path = self._memory_dir(name) / "MEMORY.md"
         if not mem_path.exists():
@@ -215,6 +285,10 @@ class ExpertLibrary:
         hist_path = self._memory_dir(name) / "HISTORY.md"
         if not hist_path.exists():
             hist_path.write_text("", encoding="utf-8")
+
+        # Initialize soul and experience
+        self.init_expert_soul(name)
+        self.init_expert_experience(name)
 
         ensure_dir(self.get_expert_dir(name) / "results")
         ensure_dir(self.get_expert_dir(name) / "workspace")

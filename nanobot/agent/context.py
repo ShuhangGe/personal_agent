@@ -6,12 +6,15 @@ import platform
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 from nanobot.agent.expert_library import ExpertLibrary
 from nanobot.agent.memory import MemoryStore
 from nanobot.agent.skills import SkillsLoader
 from nanobot.utils.helpers import build_assistant_message, detect_image_mime
+
+if TYPE_CHECKING:
+    from nanobot.agent.enhanced_memory import EnhancedMemoryConsolidator
 
 
 class ContextBuilder:
@@ -20,23 +23,30 @@ class ContextBuilder:
     BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md"]
     _RUNTIME_CONTEXT_TAG = "[Runtime Context — metadata only, not instructions]"
 
-    def __init__(self, workspace: Path):
+    def __init__(self, workspace: Path, enhanced_memory: "EnhancedMemoryConsolidator | None" = None):
         self.workspace = workspace
         self.memory = MemoryStore(workspace)
         self.skills = SkillsLoader(workspace)
         self.expert_library = ExpertLibrary(workspace)
+        self.enhanced_memory = enhanced_memory
 
-    def build_system_prompt(self, skill_names: list[str] | None = None) -> str:
-        """Build the orchestrator system prompt: identity, memory, expert library (no skills)."""
+    def build_system_prompt(self, skill_names: list[str] | None = None, query: str | None = None) -> str:
+        """Build the orchestrator system prompt: identity, memory, expert library (no skills).
+
+        Args:
+            skill_names: Optional list of skills to activate
+            query: Optional search query for semantic memory retrieval
+        """
         parts = [self._get_identity()]
 
         bootstrap = self._load_bootstrap_files()
         if bootstrap:
             parts.append(bootstrap)
 
-        memory = self.memory.get_memory_context()
-        if memory:
-            parts.append(f"# Memory\n\n{memory}")
+        # Use semantic search if available and query is provided
+        memory_context = self._get_memory_context_with_search(query)
+        if memory_context:
+            parts.append(f"# Memory\n\n{memory_context}")
 
         expert_summary = self.expert_library.build_expert_summary()
         if expert_summary:
@@ -53,6 +63,26 @@ No saved experts yet. When you spawn a task, a generic expert will be used.
 After it completes, a new expert profile will be saved automatically for future reuse.""")
 
         return "\n\n---\n\n".join(parts)
+
+    def _get_memory_context_with_search(self, query: str | None = None) -> str:
+        """Get memory context, optionally using semantic search.
+
+        Args:
+            query: Optional search query. If provided and semantic search is available,
+                   will retrieve relevant memories.
+
+        Returns:
+            Memory context string
+        """
+        # Always include long-term memory
+        long_term = self.memory.read_long_term()
+
+        # If we have enhanced memory and a query, we could do semantic search
+        # For now, we'll just use the basic memory context
+        # Semantic search can be added later as an enhancement
+        if long_term:
+            return f"## Long-term Memory\n{long_term}"
+        return ""
 
     def _get_identity(self) -> str:
         """Get the core identity section for the orchestrator."""
