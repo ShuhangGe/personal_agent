@@ -205,6 +205,11 @@ class LiteLLMProvider(LLMProvider):
 
             if "tool_call_id" in clean and clean["tool_call_id"]:
                 clean["tool_call_id"] = map_id(clean["tool_call_id"])
+
+            # Ensure assistant tool-call messages have reasoning_content —
+            # Moonshot reasoning models require it on every assistant tool-call message.
+            if clean.get("role") == "assistant" and "tool_calls" in clean:
+                clean.setdefault("reasoning_content", "")
         return sanitized
 
     async def chat(
