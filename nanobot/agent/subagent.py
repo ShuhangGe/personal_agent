@@ -160,7 +160,7 @@ class SubagentManager:
 
         try:
             tools = self._build_expert_tools(expert_workspace)
-            system_prompt = self._build_expert_prompt(expert_name, context, expert_workspace)
+            system_prompt = self._build_expert_prompt(expert_name, context, expert_workspace, expert_dir_name)
 
             # Load persistent session history for known experts
             expert_session_mgr = SessionManager(
@@ -178,25 +178,31 @@ class SubagentManager:
             evaluator_feedback = ""
             eval_round = 0
 
+            # Build the initial message list ONCE — rounds accumulate context
+            messages: list[dict[str, Any]] = [
+                {"role": "system", "content": system_prompt},
+                *history,
+                {"role": "user", "content": user_message},
+            ]
+
             for eval_round_num in range(1, _MAX_EVAL_ROUNDS + 1):
                 eval_round = eval_round_num
 
-                # Build messages for this round
-                if eval_round_num == 1:
-                    round_user_message = user_message
-                else:
-                    round_user_message = (
-                        f"The evaluator reviewed your previous output and found issues.\n\n"
-                        f"## Evaluator Feedback\n{evaluator_feedback}\n\n"
-                        f"## Original Task\n{task}\n\n"
-                        f"Please address the evaluator's feedback and produce an improved output."
-                    )
-
-                messages: list[dict[str, Any]] = [
-                    {"role": "system", "content": system_prompt},
-                    *history,
-                    {"role": "user", "content": round_user_message},
-                ]
+                if eval_round_num > 1:
+                    # Continue the conversation — expert sees all previous tool calls
+                    messages.append(build_assistant_message(
+                        final_result or "",
+                        reasoning_content="",
+                    ))
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            f"The evaluator reviewed your previous output and found issues.\n\n"
+                            f"## Evaluator Feedback\n{evaluator_feedback}\n\n"
+                            f"Please address the evaluator's feedback and produce an improved output.\n"
+                            f"You can see all your previous work in the conversation history — build on it, don't start over."
+                        ),
+                    })
 
                 # Run expert LLM loop
                 max_iterations = 25
@@ -264,6 +270,9 @@ class SubagentManager:
             self._save_session_turn(session, messages, 1 + len(history))
             expert_session_mgr.save(session)
 
+            # Derive status from eval verdict
+            task_status = "success" if verdict == "GOOD" else "partial"
+
             # Save result with evaluation metrics
             result_path, worklog_path = self._save_task_artifacts(
                 expert_name=expert_dir_name,
@@ -272,7 +281,7 @@ class SubagentManager:
                 label=label,
                 final_result=final_result,
                 tools_used=tools_used,
-                status="success",
+                status=task_status,
                 eval_verdict=verdict,
                 eval_rounds=eval_round,
                 elapsed_seconds=elapsed,
@@ -285,7 +294,7 @@ class SubagentManager:
                 task=task,
                 final_result=final_result,
                 tools_used=list(set(tools_used)),
-                status="success",
+                status=task_status,
                 eval_verdict=verdict,
                 eval_rounds=eval_round,
             )
@@ -349,6 +358,7 @@ class SubagentManager:
         expert_name: str | None,
         context: str | None,
         expert_workspace: Path,
+        expert_dir_name: str | None = None,
     ) -> str:
         """Build the expert subagent system prompt with profile, memory, skills, and worklog instructions."""
         from nanobot.agent.context import ContextBuilder
@@ -409,7 +419,7 @@ Read SKILL.md with read_file to use a skill.
 {skills_summary}""")
 
         # Worklog instructions
-        dir_name = expert_name if (expert_name and self.expert_library.expert_exists(expert_name)) else "_generic"
+        dir_name = expert_dir_name or expert_name or "_generic"
         worklog_path = self.expert_library.get_worklog_path(dir_name)
         parts.append(f"""## Work Process Rules (MUST FOLLOW)
 
@@ -613,10 +623,13 @@ This is your own workspace for writing notes or analysis files.
 
 1. Read the task description carefully
 2. Review the expert's output thoroughly
-3. If needed, read files from the expert's workspace to verify claims
-4. Assess correctness, completeness, edge cases, and overall quality
-5. Provide your review with specific feedback
-6. End with your verdict using the required format:
+3. Use read_file and list_dir to verify files in the expert's workspace
+4. IMPORTANT: You can ONLY access the expert's workspace and your own workspace.
+   Do NOT attempt to access any files outside these directories — they are blocked by sandbox.
+   Evaluate based solely on the files the expert created, not the original source.
+5. Assess correctness, completeness, edge cases, and overall quality
+6. Provide your review with specific feedback
+7. End with your verdict using the required format:
 
 ---VERDICT---
 Status: GOOD
@@ -795,7 +808,7 @@ Task ID: {task_id}
         temp_name: str,
     ) -> str | None:
         """Use LLM to generate a new expert profile, then migrate temp data to it."""
-        prompt = f"""A task was just completed successfully. Create an expert profile for this type of work.
+        prompt = f"""A task was just completed. Create an expert profile for this type of work.
 
 Task: {task}
 
@@ -824,8 +837,8 @@ Call the save_expert_profile tool with:
             )
 
             if not response.has_tool_calls:
-                logger.warning("Expert profile creation: LLM did not call save_expert_profile")
-                return None
+                logger.warning("Expert profile creation: LLM did not call save_expert_profile, using fallback")
+                return self._create_fallback_expert(task, tools_used, temp_name)
 
             args = response.tool_calls[0].arguments
             if isinstance(args, str):
@@ -835,8 +848,11 @@ Call the save_expert_profile tool with:
 
             name = args.get("expert_name", "").strip()
             if not name:
-                logger.warning("Expert profile creation: empty expert_name")
-                return None
+                logger.warning("Expert profile creation: empty expert_name, using fallback")
+                return self._create_fallback_expert(task, tools_used, temp_name)
+
+            # Sanitize name for filesystem
+            name = re.sub(r"[^a-z0-9\-]", "-", name.lower())[:60]
 
             tags = [t.strip() for t in args.get("tags", "").split(",") if t.strip()]
 
@@ -860,8 +876,43 @@ Call the save_expert_profile tool with:
             return name
 
         except Exception:
-            logger.exception("Failed to create expert profile from task")
+            logger.exception("Failed to create expert profile from task, using fallback")
+            return self._create_fallback_expert(task, tools_used, temp_name)
+
+    def _create_fallback_expert(
+        self,
+        task: str,
+        tools_used: list[str],
+        temp_name: str,
+    ) -> str | None:
+        """Create a basic expert profile when LLM profile generation fails.
+
+        Generates a name from the task description instead of using a random ID.
+        """
+        # Generate a name from the first few words of the task
+        words = re.sub(r"[^\w\s]", "", task.lower()).split()[:4]
+        if not words:
             return None
+        name = "-".join(words)
+        # Ensure uniqueness
+        base_name = name
+        counter = 1
+        while self.expert_library.expert_exists(name):
+            name = f"{base_name}-{counter}"
+            counter += 1
+
+        self.expert_library.create_expert(
+            name=name,
+            description=f"Auto-created expert for: {task[:100]}",
+            tags=[],
+            task=task,
+            approach="Automatic profile — approach not recorded.",
+            tools_used=tools_used,
+        )
+
+        self._migrate_temp_to_expert(temp_name, name)
+        logger.info("Created fallback expert profile: {}", name)
+        return name
 
     def _migrate_temp_to_expert(self, temp_name: str, expert_name: str) -> None:
         """Move workspace, sessions, and results from a temp directory to the new expert."""

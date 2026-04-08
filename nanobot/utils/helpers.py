@@ -82,8 +82,10 @@ def build_assistant_message(
     msg: dict[str, Any] = {"role": "assistant", "content": content}
     if tool_calls:
         msg["tool_calls"] = tool_calls
-    if reasoning_content is not None:
-        msg["reasoning_content"] = reasoning_content
+    # Always include reasoning_content when tool_calls are present —
+    # Moonshot reasoning models require it on assistant tool-call messages.
+    if reasoning_content is not None or tool_calls:
+        msg["reasoning_content"] = reasoning_content or ""
     if thinking_blocks:
         msg["thinking_blocks"] = thinking_blocks
     return msg

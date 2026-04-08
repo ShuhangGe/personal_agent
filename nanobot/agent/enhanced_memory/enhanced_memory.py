@@ -363,6 +363,7 @@ class EnhancedMemoryConsolidator(MemoryConsolidator):
         enable_vector_indexing: bool = True,
         embedding_provider_type: str = "openai",
         api_key: Optional[str] = None,
+        embedding_model: Optional[str] = None,
     ):
         super().__init__(
             workspace=workspace,
@@ -379,6 +380,7 @@ class EnhancedMemoryConsolidator(MemoryConsolidator):
             workspace=workspace,
             embedding_provider_type=embedding_provider_type,
             api_key=api_key,
+            embedding_model=embedding_model,
         )
 
     async def initialize(self) -> None:
