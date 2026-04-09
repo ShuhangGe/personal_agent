@@ -164,7 +164,7 @@ class SubagentManager:
 
             # Load persistent session history for known experts
             expert_session_mgr = SessionManager(
-                self.expert_library.get_expert_dir(expert_dir_name)
+                self.expert_library.get_expert_dir(expert_dir_name) / "expert"
             )
             session = expert_session_mgr.get_or_create("expert")
             history = session.get_history(max_messages=0)
@@ -480,7 +480,7 @@ What you're doing now...
 
         # Load evaluator session
         eval_session_mgr = SessionManager(
-            self.expert_library.get_expert_dir(expert_dir_name)
+            self.expert_library.get_expert_dir(expert_dir_name) / "evaluator"
         )
         eval_session = eval_session_mgr.get_or_create("evaluator")
         eval_history = eval_session.get_history(max_messages=0)
