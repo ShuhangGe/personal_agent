@@ -13,10 +13,10 @@ from nanobot.utils.helpers import ensure_dir
 
 class ExpertLibrary:
     """
-    Manages the expert library on disk.
+    Manages the agent library on disk.
 
-    Directory layout per expert:
-        experts/{name}/
+    Directory layout per agent:
+        agents/{name}/
             EXPERT.md           # Profile: description, approach, tags
             WORKLOG.md          # Live work log (plan + progress, updated during execution)
             results/
@@ -35,8 +35,20 @@ class ExpertLibrary:
 
     def __init__(self, workspace: Path):
         self.workspace = workspace
-        self.experts_dir = workspace / "experts"
-        self.registry_file = self.experts_dir / "_registry.json"
+        self.agents_dir = workspace / "agents"
+        self.registry_file = self.agents_dir / "_registry.json"
+        # Auto-migrate old experts/ directory to agents/
+        self._migrate_experts_to_agents()
+
+    # ── Legacy migration ──────────────────────────────────────────────────
+
+    def _migrate_experts_to_agents(self) -> None:
+        """One-time migration: rename experts/ directory to agents/."""
+        old_dir = self.workspace / "experts"
+        if old_dir.exists() and not self.agents_dir.exists():
+            import shutil
+            shutil.move(str(old_dir), str(self.agents_dir))
+            logger.info("Migrated {}/experts/ → {}/agents/", self.workspace, self.workspace)
 
     # ── Registry ──────────────────────────────────────────────────────────
 
@@ -49,7 +61,7 @@ class ExpertLibrary:
         return {}
 
     def save_registry(self, registry: dict) -> None:
-        ensure_dir(self.experts_dir)
+        ensure_dir(self.agents_dir)
         self.registry_file.write_text(
             json.dumps(registry, indent=2, ensure_ascii=False), encoding="utf-8"
         )
@@ -64,7 +76,7 @@ class ExpertLibrary:
     # ── Expert directory helpers ──────────────────────────────────────────
 
     def get_expert_dir(self, name: str) -> Path:
-        return self.experts_dir / name
+        return self.agents_dir / name
 
     def expert_exists(self, name: str) -> bool:
         return (self.get_expert_dir(name) / "EXPERT.md").exists()
@@ -81,9 +93,9 @@ class ExpertLibrary:
         """List all experts with their registry metadata."""
         registry = self.load_registry()
         experts = []
-        if not self.experts_dir.exists():
+        if not self.agents_dir.exists():
             return experts
-        for d in sorted(self.experts_dir.iterdir()):
+        for d in sorted(self.agents_dir.iterdir()):
             if d.is_dir() and (d / "EXPERT.md").exists():
                 meta = registry.get(d.name, {})
                 experts.append({"name": d.name, **meta})
@@ -209,9 +221,9 @@ This file contains lessons learned from evaluating expert outputs.
     def _migrate_flat_to_nested(self, name: str) -> None:
         """Migrate old flat layout to nested expert/evaluator layout.
 
-        Old: experts/{name}/workspace/, experts/{name}/memory/, experts/{name}/sessions/
-        New: experts/{name}/expert/workspace/, experts/{name}/expert/memory/, etc.
-            + experts/{name}/evaluator/workspace/, experts/{name}/evaluator/memory/, etc.
+        Old: agents/{name}/workspace/, agents/{name}/memory/, agents/{name}/sessions/
+        New: agents/{name}/expert/workspace/, agents/{name}/expert/memory/, etc.
+            + agents/{name}/evaluator/workspace/, agents/{name}/evaluator/memory/, etc.
         """
         expert_dir = self.get_expert_dir(name)
         if not expert_dir.exists():
