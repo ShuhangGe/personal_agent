@@ -817,14 +817,16 @@ Result summary: {result[:500]}
 Tools used: {', '.join(tools_used)}
 
 Call the save_expert_profile tool with:
-- expert_name: short kebab-case name describing this expert's specialty (e.g. 'scrape-product-prices')
+- expert_name: 2-3 word English name in kebab-case describing the expert's general purpose.
+  Keep it SHORT (max 30 chars). Examples: 'novel-analyzer', 'web-scraper', 'code-reviewer'.
+  NEVER use Chinese or other non-ASCII characters.
 - description: one sentence about what this expert does
 - tags: comma-separated keywords for matching similar future tasks
 - approach: brief description of the approach that worked
 - memory_notes: key facts learned that should be remembered for next time"""
 
         messages = [
-            {"role": "system", "content": "You create expert profiles from completed tasks. Call the save_expert_profile tool."},
+            {"role": "system", "content": "You create expert profiles from completed tasks. Call the save_expert_profile tool. The expert_name MUST be short English kebab-case only."},
             {"role": "user", "content": prompt},
         ]
 
@@ -851,8 +853,13 @@ Call the save_expert_profile tool with:
                 logger.warning("Expert profile creation: empty expert_name, using fallback")
                 return self._create_fallback_expert(task, tools_used, temp_name)
 
-            # Sanitize name for filesystem
-            name = re.sub(r"[^a-z0-9\-]", "-", name.lower())[:60]
+            # Sanitize: keep only a-z, 0-9, hyphens; strip non-ASCII
+            name = re.sub(r"[^a-z0-9\-]", "-", name.lower())
+            name = re.sub(r"-{2,}", "-", name).strip("-")
+            # If sanitization produced garbage (no letters left), use fallback
+            if not re.search(r"[a-z]", name) or len(name) < 2:
+                return self._create_fallback_expert(task, tools_used, temp_name)
+            name = name[:30]
 
             tags = [t.strip() for t in args.get("tags", "").split(",") if t.strip()]
 
@@ -887,19 +894,11 @@ Call the save_expert_profile tool with:
     ) -> str | None:
         """Create a basic expert profile when LLM profile generation fails.
 
-        Generates a name from the task description instead of using a random ID.
+        Generates a short name like 'expert-abc123' instead of dumping task text.
         """
-        # Generate a name from the first few words of the task
-        words = re.sub(r"[^\w\s]", "", task.lower()).split()[:4]
-        if not words:
-            return None
-        name = "-".join(words)
-        # Ensure uniqueness
-        base_name = name
-        counter = 1
-        while self.expert_library.expert_exists(name):
-            name = f"{base_name}-{counter}"
-            counter += 1
+        # Generate a short unique name
+        short_id = uuid.uuid4().hex[:6]
+        name = f"expert-{short_id}"
 
         self.expert_library.create_expert(
             name=name,
