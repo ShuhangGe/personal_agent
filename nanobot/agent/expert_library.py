@@ -262,12 +262,18 @@ This file contains lessons learned from evaluating expert outputs.
         logger.info("Migrated expert '{}' from flat to nested layout", name)
 
     def _init_evaluator_dirs(self, name: str) -> None:
-        """Create and initialize evaluator subdirectories and memory files."""
+        """Create and initialize evaluator subdirectories and memory files.
+
+        Only writes default SOUL.md / EXPERIENCE.md when they don't already
+        exist, so migrated data from temp experts is preserved.
+        """
         ensure_dir(self.get_evaluator_workspace(name))
         ensure_dir(self.get_evaluator_sessions_dir(name))
-        ensure_dir(self._evaluator_memory_dir(name))
-        self.init_evaluator_soul(name)
-        self.init_evaluator_experience(name)
+        mem_dir = self._evaluator_memory_dir(name)
+        if not (mem_dir / "SOUL.md").exists():
+            self.init_evaluator_soul(name)
+        if not (mem_dir / "EXPERIENCE.md").exists():
+            self.init_evaluator_experience(name)
 
     def load_expert_memory(self, name: str) -> str:
         path = self._memory_dir(name) / "MEMORY.md"

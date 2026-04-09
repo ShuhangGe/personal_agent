@@ -793,11 +793,12 @@ Task ID: {task_id}
             )
             await self._update_expert_memory(expert_name, task, final_result)
             await self._update_expert_experience(expert_name, task, final_result, status)
-            # Update evaluator memory too
             await self._update_evaluator_memory(expert_name, task, final_result, eval_verdict, eval_rounds)
             return None
         else:
             created_name = await self._create_expert_from_task(task, final_result, tools_used, temp_name)
+            if created_name:
+                await self._update_evaluator_memory(created_name, task, final_result, eval_verdict, eval_rounds)
             return created_name
 
     async def _create_expert_from_task(
@@ -921,8 +922,11 @@ Call the save_expert_profile tool with:
         if not temp_dir.exists():
             return
 
-        # Migrate expert subdirs (temp was created with nested layout)
-        for subdir in ("expert/workspace", "expert/sessions", "expert/memory"):
+        # Migrate expert and evaluator subdirs (temp was created with nested layout)
+        for subdir in (
+            "expert/workspace", "expert/sessions", "expert/memory",
+            "evaluator/workspace", "evaluator/sessions", "evaluator/memory",
+        ):
             src = temp_dir / subdir
             dst = expert_dir / subdir
             if not src.exists():
