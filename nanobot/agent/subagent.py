@@ -851,10 +851,12 @@ Call the save_expert_profile tool with:
 - description: one sentence about what this expert does
 - tags: comma-separated keywords for matching similar future tasks
 - approach: brief description of the approach that worked
-- memory_notes: key facts learned that should be remembered for next time"""
+- memory_notes: key facts learned that should be remembered for next time
+
+If you cannot call the tool, respond ONLY with a JSON object containing these fields."""
 
         messages = [
-            {"role": "system", "content": "You create expert profiles from completed tasks. Call the save_expert_profile tool. The expert_name MUST be short English kebab-case only."},
+            {"role": "system", "content": "You create expert profiles from completed tasks. Call the save_expert_profile tool. The expert_name MUST be short English kebab-case only. If you cannot call tools, respond with a JSON object instead."},
             {"role": "user", "content": prompt},
         ]
 
@@ -866,28 +868,32 @@ Call the save_expert_profile tool with:
                 tool_choice={"type": "function", "function": {"name": "save_expert_profile"}},
             )
 
-            if not response.has_tool_calls:
-                logger.warning("Expert profile creation: LLM did not call save_expert_profile, using fallback")
-                return self._create_fallback_expert(task, tools_used, temp_name)
+            args: dict[str, Any] | None = None
 
-            args = response.tool_calls[0].arguments
-            if isinstance(args, str):
-                args = json.loads(args)
-            if isinstance(args, list):
-                args = args[0] if args else {}
+            if response.has_tool_calls:
+                args = response.tool_calls[0].arguments
+                if isinstance(args, str):
+                    args = json.loads(args)
+                if isinstance(args, list):
+                    args = args[0] if args else {}
+            elif response.content:
+                # Some models don't support tool_choice — try parsing text as JSON
+                args = self._extract_json_from_text(response.content)
+                if args:
+                    logger.info("Expert profile creation: extracted profile from text response (model may not support tool_choice)")
+
+            if not args or not isinstance(args, dict):
+                logger.warning("Expert profile creation: no valid profile data, using fallback")
+                return self._create_fallback_expert(task, tools_used, temp_name)
 
             name = args.get("expert_name", "").strip()
             if not name:
                 logger.warning("Expert profile creation: empty expert_name, using fallback")
                 return self._create_fallback_expert(task, tools_used, temp_name)
 
-            # Sanitize: keep only a-z, 0-9, hyphens; strip non-ASCII
-            name = re.sub(r"[^a-z0-9\-]", "-", name.lower())
-            name = re.sub(r"-{2,}", "-", name).strip("-")
-            # If sanitization produced garbage (no letters left), use fallback
-            if not re.search(r"[a-z]", name) or len(name) < 2:
+            name = self._sanitize_expert_name(name)
+            if not name:
                 return self._create_fallback_expert(task, tools_used, temp_name)
-            name = name[:30]
 
             tags = [t.strip() for t in args.get("tags", "").split(",") if t.strip()]
 
@@ -914,6 +920,34 @@ Call the save_expert_profile tool with:
             logger.exception("Failed to create expert profile from task, using fallback")
             return self._create_fallback_expert(task, tools_used, temp_name)
 
+    @staticmethod
+    def _extract_json_from_text(text: str) -> dict[str, Any] | None:
+        """Try to extract a JSON object from LLM text when tool calling fails."""
+        # Try the whole text first
+        try:
+            data = json.loads(text.strip())
+            if isinstance(data, dict) and "expert_name" in data:
+                return data
+        except (json.JSONDecodeError, ValueError):
+            pass
+        # Try to find a JSON block in the text
+        match = re.search(r"\{[^{}]*\"expert_name\"[^{}]*\}", text, re.DOTALL)
+        if match:
+            try:
+                return json.loads(match.group())
+            except (json.JSONDecodeError, ValueError):
+                pass
+        return None
+
+    @staticmethod
+    def _sanitize_expert_name(name: str) -> str | None:
+        """Sanitize an expert name to short kebab-case ASCII. Returns None if unusable."""
+        name = re.sub(r"[^a-z0-9\-]", "-", name.lower())
+        name = re.sub(r"-{2,}", "-", name).strip("-")
+        if not re.search(r"[a-z]", name) or len(name) < 2:
+            return None
+        return name[:30]
+
     def _create_fallback_expert(
         self,
         task: str,
@@ -922,11 +956,10 @@ Call the save_expert_profile tool with:
     ) -> str | None:
         """Create a basic expert profile when LLM profile generation fails.
 
-        Generates a short name like 'expert-abc123' instead of dumping task text.
+        Derives a meaningful name from the task's dominant tools and keywords
+        instead of a random hash.
         """
-        # Generate a short unique name
-        short_id = uuid.uuid4().hex[:6]
-        name = f"expert-{short_id}"
+        name = self._derive_name_from_task(task, tools_used)
 
         self.expert_library.create_expert(
             name=name,
@@ -940,6 +973,35 @@ Call the save_expert_profile tool with:
         self._migrate_temp_to_expert(temp_name, name)
         logger.info("Created fallback expert profile: {}", name)
         return name
+
+    @staticmethod
+    def _derive_name_from_task(task: str, tools_used: list[str]) -> str:
+        """Derive a short kebab-case name from the task description and tools.
+
+        Uses keyword extraction as a best-effort fallback when LLM naming fails.
+        """
+        tool_hints = {
+            "web_search": "researcher",
+            "web_fetch": "web-reader",
+            "exec": "script-runner",
+            "read_file": "file-reader",
+            "write_file": "file-writer",
+        }
+        # Pick the most descriptive tool
+        for tool, hint in tool_hints.items():
+            if tool in tools_used and len(tools_used) <= 2:
+                return hint
+
+        # Extract English words from the task
+        words = re.findall(r"[a-zA-Z]{3,}", task)
+        if words:
+            slug = "-".join(w.lower() for w in words[:3])
+            slug = slug[:25]
+            return slug
+
+        # Last resort
+        short_id = uuid.uuid4().hex[:6]
+        return f"task-{short_id}"
 
     def _migrate_temp_to_expert(self, temp_name: str, expert_name: str) -> None:
         """Move workspace, sessions, and results from a temp directory to the new expert."""

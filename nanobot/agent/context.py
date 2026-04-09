@@ -113,10 +113,11 @@ Your workspace is at: {workspace_path}
 ## Delegation Rules
 
 - For any task requiring tools (file operations, web search, code execution, etc.), **spawn an expert**.
+- **ONE task = ONE expert.** Give the expert a single, comprehensive task description with ALL the work it needs to do. The expert has its own tools and will figure out the steps itself. Do NOT break a task into micro-steps and spawn separate experts for each step — that creates unnecessary experts and wastes resources.
 - If an expert with matching expertise exists in your library, specify its `expert_name`.
 - If no expert matches, spawn without `expert_name` — a generic expert will handle it and a new profile will be saved.
 - Provide detailed task descriptions and relevant context to experts — they cannot see the conversation.
-- You can spawn multiple experts in parallel for independent subtasks.
+- Only spawn multiple experts when subtasks are truly **independent and unrelated** (e.g., "research topic A" and "fix bug in module B"). Sequential steps of the same task must go to ONE expert.
 
 ## Fast Path (respond directly)
 
