@@ -297,6 +297,7 @@ class SubagentManager:
                 status=task_status,
                 eval_verdict=verdict,
                 eval_rounds=eval_round,
+                evaluator_feedback=evaluator_feedback,
             )
 
             # If a new expert was created from a temp task, update paths
@@ -400,6 +401,17 @@ Use relative paths when possible — they resolve against your workspace.
             experience = self.expert_library.load_expert_experience(expert_name)
             if experience:
                 parts.append(f"## Your Experience (Lessons Learned)\n\n{experience}")
+
+            # Load evaluator guardrails (read-only constraints from the evaluator)
+            guardrails = self.expert_library.load_evaluator_guardrails(expert_name)
+            if guardrails:
+                parts.append(f"""## Guardrails (from Evaluator — YOU MUST FOLLOW)
+
+The following guardrails are maintained by your evaluator based on past reviews.
+You MUST follow these rules. You CANNOT modify this file.
+Violating these guardrails will result in a NOT GOOD verdict.
+
+{guardrails}""")
 
         # Load full skills catalog from the main workspace
         skills_loader = SkillsLoader(self.workspace)
@@ -619,6 +631,10 @@ This is your own workspace for writing notes or analysis files.
             if experience:
                 parts.append(f"## Your Experience\n\n{experience}")
 
+            guardrails = self.expert_library.load_evaluator_guardrails(expert_name)
+            if guardrails:
+                parts.append(f"## Current Guardrails (you maintain this)\n\n{guardrails}")
+
         parts.append("""## Review Instructions
 
 1. Read the task description carefully
@@ -627,9 +643,13 @@ This is your own workspace for writing notes or analysis files.
 4. IMPORTANT: You can ONLY access the expert's workspace and your own workspace.
    Do NOT attempt to access any files outside these directories — they are blocked by sandbox.
    Evaluate based solely on the files the expert created, not the original source.
-5. Assess correctness, completeness, edge cases, and overall quality
-6. Provide your review with specific feedback
-7. End with your verdict using the required format:
+5. Check if the expert violated any existing guardrails (failed approaches,
+   anti-patterns, quality standards). If so, this is an automatic NOT GOOD.
+6. Assess correctness, completeness, edge cases, and overall quality
+7. Provide your review with specific feedback — especially note:
+   - Any approach that failed and should be added to guardrails
+   - Any quality standard that should be enforced going forward
+8. End with your verdict using the required format:
 
 ---VERDICT---
 Status: GOOD
@@ -777,10 +797,11 @@ Task ID: {task_id}
         status: str,
         eval_verdict: str = "",
         eval_rounds: int = 0,
+        evaluator_feedback: str = "",
     ) -> str | None:
         """After task completion: create new expert or update existing one's memory.
 
-        Also updates evaluator memory for existing experts.
+        Also updates evaluator memory and guardrails.
         Returns the created expert name if a new expert was born, else None.
         """
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -794,11 +815,17 @@ Task ID: {task_id}
             await self._update_expert_memory(expert_name, task, final_result)
             await self._update_expert_experience(expert_name, task, final_result, status)
             await self._update_evaluator_memory(expert_name, task, final_result, eval_verdict, eval_rounds)
+            await self._update_evaluator_guardrails(
+                expert_name, task, final_result, eval_verdict, eval_rounds, evaluator_feedback,
+            )
             return None
         else:
             created_name = await self._create_expert_from_task(task, final_result, tools_used, temp_name)
             if created_name:
                 await self._update_evaluator_memory(created_name, task, final_result, eval_verdict, eval_rounds)
+                await self._update_evaluator_guardrails(
+                    created_name, task, final_result, eval_verdict, eval_rounds, evaluator_feedback,
+                )
             return created_name
 
     async def _create_expert_from_task(
@@ -1111,6 +1138,70 @@ Return the updated memory as markdown."""
                 logger.debug("Updated evaluator memory for expert: {}", expert_name)
         except Exception:
             logger.exception("Failed to update evaluator memory for {}", expert_name)
+
+    async def _update_evaluator_guardrails(
+        self,
+        expert_name: str,
+        task: str,
+        result: str,
+        verdict: str,
+        eval_rounds: int,
+        evaluator_feedback: str,
+    ) -> None:
+        """Update GUARDRAILS.md with lessons from this evaluation.
+
+        Called for both GOOD and NOT GOOD verdicts so the expert accumulates
+        knowledge about what to avoid and what quality standards to maintain.
+        """
+        current = self.expert_library.load_evaluator_guardrails(expert_name)
+        now_str = datetime.now().strftime("%Y-%m-%d")
+
+        prompt = f"""You maintain a GUARDRAILS file that tells the expert what NOT to do and
+what quality standards to meet. Update it based on this evaluation.
+
+## Current Guardrails
+{current or "(empty — first evaluation)"}
+
+## Task
+{task}
+
+## Expert Output (excerpt)
+{result[:600]}
+
+## Evaluator Feedback
+{evaluator_feedback[:800] if evaluator_feedback else "(no detailed feedback)"}
+
+## Verdict
+{verdict} after {eval_rounds} round(s) — Date: {now_str}
+
+Rules for updating:
+- Keep ALL existing guardrail entries (never remove learned lessons).
+- If verdict is NOT GOOD: add the specific failed approach and why it failed
+  under "Failed Approaches". Add any new anti-patterns discovered.
+- If verdict is GOOD: add any quality standards or good practices that should
+  be maintained. If the expert almost failed, note what to watch out for.
+- Be concise and specific — each entry should be actionable.
+- Use the existing section structure (Failed Approaches, Anti-Patterns,
+  Quality Standards). Add new sections only if truly needed.
+
+Return the complete updated GUARDRAILS.md content."""
+
+        messages = [
+            {"role": "system", "content": "You maintain an expert's guardrails file. Return only the updated guardrails content as markdown. Preserve all existing entries."},
+            {"role": "user", "content": prompt},
+        ]
+
+        try:
+            response = await self.provider.chat_with_retry(
+                messages=messages, tools=[], model=self.model,
+            )
+            if response.content and response.content.strip():
+                self.expert_library.save_evaluator_guardrails(
+                    expert_name, response.content.strip(),
+                )
+                logger.debug("Updated guardrails for expert: {}", expert_name)
+        except Exception:
+            logger.exception("Failed to update guardrails for {}", expert_name)
 
     # ── Announcement ─────────────────────────────────────────────────────
 

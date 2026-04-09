@@ -30,7 +30,7 @@ class ExpertLibrary:
                 workspace/      # Evaluator's isolated file sandbox
                 sessions/       # Evaluator conversation history
                 memory/
-                    MEMORY.md, SOUL.md, EXPERIENCE.md
+                    MEMORY.md, SOUL.md, EXPERIENCE.md, GUARDRAILS.md
     """
 
     def __init__(self, workspace: Path):
@@ -216,6 +216,37 @@ This file contains lessons learned from evaluating expert outputs.
 """
         self.save_evaluator_experience(name, experience_content)
 
+    # ── Evaluator guardrails (read-only for expert) ──────────────────────
+
+    def load_evaluator_guardrails(self, name: str) -> str:
+        """Load the evaluator-maintained guardrails for this expert."""
+        path = self._evaluator_memory_dir(name) / "GUARDRAILS.md"
+        if path.exists():
+            return path.read_text(encoding="utf-8")
+        return ""
+
+    def save_evaluator_guardrails(self, name: str, content: str) -> None:
+        """Save updated guardrails (only the evaluator should call this)."""
+        (self._evaluator_memory_dir(name) / "GUARDRAILS.md").write_text(content, encoding="utf-8")
+
+    def init_evaluator_guardrails(self, name: str) -> None:
+        """Initialize an empty guardrails file for a new expert."""
+        content = f"""# Guardrails for {name}
+
+This file is maintained by the evaluator. The expert MUST follow these rules
+but CANNOT modify this file. Updated after every evaluation.
+
+## Failed Approaches (Do NOT Repeat)
+
+
+## Anti-Patterns
+
+
+## Quality Standards
+
+"""
+        self.save_evaluator_guardrails(name, content)
+
     # ── Migration ────────────────────────────────────────────────────────
 
     def _migrate_flat_to_nested(self, name: str) -> None:
@@ -264,8 +295,8 @@ This file contains lessons learned from evaluating expert outputs.
     def _init_evaluator_dirs(self, name: str) -> None:
         """Create and initialize evaluator subdirectories and memory files.
 
-        Only writes default SOUL.md / EXPERIENCE.md when they don't already
-        exist, so migrated data from temp experts is preserved.
+        Only writes defaults when they don't already exist, so migrated data
+        from temp experts is preserved.
         """
         ensure_dir(self.get_evaluator_workspace(name))
         ensure_dir(self.get_evaluator_sessions_dir(name))
@@ -274,6 +305,8 @@ This file contains lessons learned from evaluating expert outputs.
             self.init_evaluator_soul(name)
         if not (mem_dir / "EXPERIENCE.md").exists():
             self.init_evaluator_experience(name)
+        if not (mem_dir / "GUARDRAILS.md").exists():
+            self.init_evaluator_guardrails(name)
 
     def load_expert_memory(self, name: str) -> str:
         path = self._memory_dir(name) / "MEMORY.md"
