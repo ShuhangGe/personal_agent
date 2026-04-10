@@ -1,4 +1,7 @@
-"""Expert library for managing emergent expert profiles, memory, worklogs, and results."""
+"""Agent library for managing subagent profiles, memory, worklogs, and results.
+
+Each subagent has an expert (executes tasks) and an evaluator (reviews quality).
+"""
 
 from __future__ import annotations
 
@@ -11,13 +14,13 @@ from loguru import logger
 from nanobot.utils.helpers import ensure_dir
 
 
-class ExpertLibrary:
+class AgentLibrary:
     """
-    Manages the agent library on disk.
+    Manages the subagent library on disk.
 
-    Directory layout per agent:
+    Directory layout per subagent:
         agents/{name}/
-            EXPERT.md           # Profile: description, approach, tags
+            AGENT.md            # Profile: description, approach, tags
             WORKLOG.md          # Live work log (plan + progress, updated during execution)
             results/
                 {timestamp}.md  # Detailed result files
@@ -37,7 +40,6 @@ class ExpertLibrary:
         self.workspace = workspace
         self.agents_dir = workspace / "agents"
         self.registry_file = self.agents_dir / "_registry.json"
-        # Auto-migrate old experts/ directory to agents/
         self._migrate_experts_to_agents()
 
     # ── Legacy migration ──────────────────────────────────────────────────
@@ -57,7 +59,7 @@ class ExpertLibrary:
             try:
                 return json.loads(self.registry_file.read_text(encoding="utf-8"))
             except (json.JSONDecodeError, OSError):
-                logger.warning("Corrupt expert registry, rebuilding")
+                logger.warning("Corrupt agent registry, rebuilding")
         return {}
 
     def save_registry(self, registry: dict) -> None:
@@ -66,72 +68,155 @@ class ExpertLibrary:
             json.dumps(registry, indent=2, ensure_ascii=False), encoding="utf-8"
         )
 
-    def update_registry_entry(self, expert_name: str, **updates: object) -> None:
+    def update_registry_entry(self, name: str, **updates: object) -> None:
         registry = self.load_registry()
-        entry = registry.get(expert_name, {})
+        entry = registry.get(name, {})
         entry.update(updates)
-        registry[expert_name] = entry
+        registry[name] = entry
         self.save_registry(registry)
 
-    # ── Expert directory helpers ──────────────────────────────────────────
+    # ── Agent directory helpers ───────────────────────────────────────────
 
-    def get_expert_dir(self, name: str) -> Path:
+    def get_agent_dir(self, name: str) -> Path:
         return self.agents_dir / name
 
-    def expert_exists(self, name: str) -> bool:
-        return (self.get_expert_dir(name) / "EXPERT.md").exists()
+    def agent_exists(self, name: str) -> bool:
+        return (self.get_agent_dir(name) / "AGENT.md").exists()
+
+    def list_agents(self) -> list[dict]:
+        """List all subagents with their registry metadata."""
+        registry = self.load_registry()
+        agents = []
+        if not self.agents_dir.exists():
+            return agents
+        for d in sorted(self.agents_dir.iterdir()):
+            if d.is_dir() and (d / "AGENT.md").exists():
+                meta = registry.get(d.name, {})
+                agents.append({"name": d.name, **meta})
+        return agents
+
+    # ── Expert-half workspace helpers ─────────────────────────────────────
 
     def get_expert_workspace(self, name: str) -> Path:
         """Return the expert's isolated workspace directory, creating it if needed."""
-        return ensure_dir(self.get_expert_dir(name) / "expert" / "workspace")
+        return ensure_dir(self.get_agent_dir(name) / "expert" / "workspace")
 
     def get_expert_sessions_dir(self, name: str) -> Path:
         """Return the expert's sessions directory, creating it if needed."""
-        return ensure_dir(self.get_expert_dir(name) / "expert" / "sessions")
+        return ensure_dir(self.get_agent_dir(name) / "expert" / "sessions")
 
-    def list_experts(self) -> list[dict]:
-        """List all experts with their registry metadata."""
-        registry = self.load_registry()
-        experts = []
-        if not self.agents_dir.exists():
-            return experts
-        for d in sorted(self.agents_dir.iterdir()):
-            if d.is_dir() and (d / "EXPERT.md").exists():
-                meta = registry.get(d.name, {})
-                experts.append({"name": d.name, **meta})
-        return experts
+    # ── Agent profile CRUD ────────────────────────────────────────────────
 
-    # ── Profile CRUD ─────────────────────────────────────────────────────
-
-    def load_expert_profile(self, name: str) -> str | None:
-        path = self.get_expert_dir(name) / "EXPERT.md"
+    def load_agent_profile(self, name: str) -> str | None:
+        path = self.get_agent_dir(name) / "AGENT.md"
         if path.exists():
             return path.read_text(encoding="utf-8")
         return None
 
-    def save_expert_profile(self, name: str, content: str) -> None:
-        expert_dir = ensure_dir(self.get_expert_dir(name))
-        (expert_dir / "EXPERT.md").write_text(content, encoding="utf-8")
+    def save_agent_profile(self, name: str, content: str) -> None:
+        agent_dir = ensure_dir(self.get_agent_dir(name))
+        (agent_dir / "AGENT.md").write_text(content, encoding="utf-8")
 
-    # ── Per-expert memory ────────────────────────────────────────────────
+    # ── Expert-half memory ────────────────────────────────────────────────
 
     def _memory_dir(self, name: str) -> Path:
-        return ensure_dir(self.get_expert_dir(name) / "expert" / "memory")
+        return ensure_dir(self.get_agent_dir(name) / "expert" / "memory")
 
-    # ── Evaluator directory helpers ─────────────────────────────────────
+    def load_expert_memory(self, name: str) -> str:
+        path = self._memory_dir(name) / "MEMORY.md"
+        if path.exists():
+            return path.read_text(encoding="utf-8")
+        return ""
+
+    def save_expert_memory(self, name: str, content: str) -> None:
+        (self._memory_dir(name) / "MEMORY.md").write_text(content, encoding="utf-8")
+
+    def append_expert_history(self, name: str, entry: str) -> None:
+        path = self._memory_dir(name) / "HISTORY.md"
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(entry.rstrip() + "\n\n")
+
+    # ── Expert-half soul (identity/personality) ───────────────────────────
+
+    def load_expert_soul(self, name: str) -> str:
+        """Load the expert's soul (identity and personality)."""
+        path = self._memory_dir(name) / "SOUL.md"
+        if path.exists():
+            return path.read_text(encoding="utf-8")
+        return ""
+
+    def save_expert_soul(self, name: str, content: str) -> None:
+        """Save the expert's soul (identity and personality)."""
+        (self._memory_dir(name) / "SOUL.md").write_text(content, encoding="utf-8")
+
+    def init_expert_soul(self, name: str) -> None:
+        """Initialize a default soul for a new expert."""
+        soul_content = f"""# {name} Identity
+
+## Personality
+- I am methodical and detail-oriented
+- I prefer structured outputs
+- I focus on actionable insights, not just observations
+
+## Expertise
+- Specialized in tasks matching my tags
+- Continuously learning from each task execution
+
+## Constraints
+- Stay focused on the assigned task
+- Provide clear, actionable results
+- Communicate progress through the work log
+
+## Communication Style
+- Concise and clear
+- Results-oriented
+- Transparent about challenges and solutions
+"""
+        self.save_expert_soul(name, soul_content)
+
+    # ── Expert-half experience (lessons learned) ──────────────────────────
+
+    def load_expert_experience(self, name: str) -> str:
+        """Load the expert's experience (lessons learned from previous runs)."""
+        path = self._memory_dir(name) / "EXPERIENCE.md"
+        if path.exists():
+            return path.read_text(encoding="utf-8")
+        return ""
+
+    def save_expert_experience(self, name: str, content: str) -> None:
+        """Save the expert's experience (lessons learned)."""
+        (self._memory_dir(name) / "EXPERIENCE.md").write_text(content, encoding="utf-8")
+
+    def append_expert_experience(self, name: str, entry: str) -> None:
+        """Append a new experience entry to the expert's experience file."""
+        path = self._memory_dir(name) / "EXPERIENCE.md"
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(entry.rstrip() + "\n\n")
+
+    def init_expert_experience(self, name: str) -> None:
+        """Initialize an empty experience file for a new expert."""
+        experience_content = """# Learned Experience
+
+This file contains lessons learned from previous task executions.
+
+---
+"""
+        self.save_expert_experience(name, experience_content)
+
+    # ── Evaluator-half directory helpers ──────────────────────────────────
 
     def get_evaluator_workspace(self, name: str) -> Path:
         """Return the evaluator's isolated workspace directory, creating it if needed."""
-        return ensure_dir(self.get_expert_dir(name) / "evaluator" / "workspace")
+        return ensure_dir(self.get_agent_dir(name) / "evaluator" / "workspace")
 
     def get_evaluator_sessions_dir(self, name: str) -> Path:
         """Return the evaluator's sessions directory, creating it if needed."""
-        return ensure_dir(self.get_expert_dir(name) / "evaluator" / "sessions")
+        return ensure_dir(self.get_agent_dir(name) / "evaluator" / "sessions")
 
     def _evaluator_memory_dir(self, name: str) -> Path:
-        return ensure_dir(self.get_expert_dir(name) / "evaluator" / "memory")
+        return ensure_dir(self.get_agent_dir(name) / "evaluator" / "memory")
 
-    # ── Evaluator memory ────────────────────────────────────────────────
+    # ── Evaluator-half memory ─────────────────────────────────────────────
 
     def load_evaluator_memory(self, name: str) -> str:
         path = self._evaluator_memory_dir(name) / "MEMORY.md"
@@ -219,7 +304,7 @@ This file contains lessons learned from evaluating expert outputs.
     # ── Evaluator guardrails (read-only for expert) ──────────────────────
 
     def load_evaluator_guardrails(self, name: str) -> str:
-        """Load the evaluator-maintained guardrails for this expert."""
+        """Load the evaluator-maintained guardrails for this subagent."""
         path = self._evaluator_memory_dir(name) / "GUARDRAILS.md"
         if path.exists():
             return path.read_text(encoding="utf-8")
@@ -230,7 +315,7 @@ This file contains lessons learned from evaluating expert outputs.
         (self._evaluator_memory_dir(name) / "GUARDRAILS.md").write_text(content, encoding="utf-8")
 
     def init_evaluator_guardrails(self, name: str) -> None:
-        """Initialize an empty guardrails file for a new expert."""
+        """Initialize an empty guardrails file for a new subagent."""
         content = f"""# Guardrails for {name}
 
 This file is maintained by the evaluator. The expert MUST follow these rules
@@ -256,47 +341,38 @@ but CANNOT modify this file. Updated after every evaluation.
         New: agents/{name}/expert/workspace/, agents/{name}/expert/memory/, etc.
             + agents/{name}/evaluator/workspace/, agents/{name}/evaluator/memory/, etc.
         """
-        expert_dir = self.get_expert_dir(name)
-        if not expert_dir.exists():
+        agent_dir = self.get_agent_dir(name)
+        if not agent_dir.exists():
             return
 
-        # Only migrate if old flat layout exists and new layout doesn't
-        old_workspace = expert_dir / "workspace"
-        old_memory = expert_dir / "memory"
-        old_sessions = expert_dir / "sessions"
+        old_workspace = agent_dir / "workspace"
+        old_memory = agent_dir / "memory"
+        old_sessions = agent_dir / "sessions"
 
-        new_expert_workspace = expert_dir / "expert" / "workspace"
-        new_expert_memory = expert_dir / "expert" / "memory"
-        new_expert_sessions = expert_dir / "expert" / "sessions"
+        new_expert_workspace = agent_dir / "expert" / "workspace"
+        new_expert_memory = agent_dir / "expert" / "memory"
+        new_expert_sessions = agent_dir / "expert" / "sessions"
 
-        # Skip if already migrated
         if new_expert_workspace.exists():
             return
 
         import shutil
 
-        # Move workspace → expert/workspace
         if old_workspace.exists():
             shutil.move(str(old_workspace), str(new_expert_workspace))
-
-        # Move memory → expert/memory
         if old_memory.exists():
             shutil.move(str(old_memory), str(new_expert_memory))
-
-        # Move sessions → expert/sessions
         if old_sessions.exists():
             shutil.move(str(old_sessions), str(new_expert_sessions))
 
-        # Create evaluator subdirs with initialized files
         self._init_evaluator_dirs(name)
-
-        logger.info("Migrated expert '{}' from flat to nested layout", name)
+        logger.info("Migrated agent '{}' from flat to nested layout", name)
 
     def _init_evaluator_dirs(self, name: str) -> None:
         """Create and initialize evaluator subdirectories and memory files.
 
         Only writes defaults when they don't already exist, so migrated data
-        from temp experts is preserved.
+        from temp subagents is preserved.
         """
         ensure_dir(self.get_evaluator_workspace(name))
         ensure_dir(self.get_evaluator_sessions_dir(name))
@@ -308,151 +384,70 @@ but CANNOT modify this file. Updated after every evaluation.
         if not (mem_dir / "GUARDRAILS.md").exists():
             self.init_evaluator_guardrails(name)
 
-    def load_expert_memory(self, name: str) -> str:
-        path = self._memory_dir(name) / "MEMORY.md"
-        if path.exists():
-            return path.read_text(encoding="utf-8")
-        return ""
-
-    def save_expert_memory(self, name: str, content: str) -> None:
-        (self._memory_dir(name) / "MEMORY.md").write_text(content, encoding="utf-8")
-
-    def append_expert_history(self, name: str, entry: str) -> None:
-        path = self._memory_dir(name) / "HISTORY.md"
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(entry.rstrip() + "\n\n")
-
-    # ── Per-expert soul (identity/personality) ─────────────────────────────
-
-    def load_expert_soul(self, name: str) -> str:
-        """Load the expert's soul (identity and personality)."""
-        path = self._memory_dir(name) / "SOUL.md"
-        if path.exists():
-            return path.read_text(encoding="utf-8")
-        return ""
-
-    def save_expert_soul(self, name: str, content: str) -> None:
-        """Save the expert's soul (identity and personality)."""
-        (self._memory_dir(name) / "SOUL.md").write_text(content, encoding="utf-8")
-
-    def init_expert_soul(self, name: str) -> None:
-        """Initialize a default soul for a new expert."""
-        soul_content = f"""# {name} Identity
-
-## Personality
-- I am methodical and detail-oriented
-- I prefer structured outputs
-- I focus on actionable insights, not just observations
-
-## Expertise
-- Specialized in tasks matching my tags
-- Continuously learning from each task execution
-
-## Constraints
-- Stay focused on the assigned task
-- Provide clear, actionable results
-- Communicate progress through the work log
-
-## Communication Style
-- Concise and clear
-- Results-oriented
-- Transparent about challenges and solutions
-"""
-        self.save_expert_soul(name, soul_content)
-
-    # ── Per-expert experience (lessons learned) ────────────────────────────
-
-    def load_expert_experience(self, name: str) -> str:
-        """Load the expert's experience (lessons learned from previous runs)."""
-        path = self._memory_dir(name) / "EXPERIENCE.md"
-        if path.exists():
-            return path.read_text(encoding="utf-8")
-        return ""
-
-    def save_expert_experience(self, name: str, content: str) -> None:
-        """Save the expert's experience (lessons learned)."""
-        (self._memory_dir(name) / "EXPERIENCE.md").write_text(content, encoding="utf-8")
-
-    def append_expert_experience(self, name: str, entry: str) -> None:
-        """Append a new experience entry to the expert's experience file."""
-        path = self._memory_dir(name) / "EXPERIENCE.md"
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(entry.rstrip() + "\n\n")
-
-    def init_expert_experience(self, name: str) -> None:
-        """Initialize an empty experience file for a new expert."""
-        experience_content = """# Learned Experience
-
-This file contains lessons learned from previous task executions.
-
----
-"""
-        self.save_expert_experience(name, experience_content)
-
     # ── Worklog ──────────────────────────────────────────────────────────
 
     def write_worklog(self, name: str, content: str) -> Path:
-        path = self.get_expert_dir(name) / "WORKLOG.md"
+        path = self.get_agent_dir(name) / "WORKLOG.md"
         ensure_dir(path.parent)
         path.write_text(content, encoding="utf-8")
         return path
 
     def read_worklog(self, name: str) -> str | None:
-        path = self.get_expert_dir(name) / "WORKLOG.md"
+        path = self.get_agent_dir(name) / "WORKLOG.md"
         if path.exists():
             return path.read_text(encoding="utf-8")
         return None
 
     def get_worklog_path(self, name: str) -> Path:
-        return self.get_expert_dir(name) / "WORKLOG.md"
+        return self.get_agent_dir(name) / "WORKLOG.md"
 
     # ── Results ──────────────────────────────────────────────────────────
 
     def save_result(self, name: str, content: str) -> Path:
         """Save a timestamped result file. Returns the file path."""
-        results_dir = ensure_dir(self.get_expert_dir(name) / "results")
+        results_dir = ensure_dir(self.get_agent_dir(name) / "results")
         ts = datetime.now().strftime("%Y-%m-%d-%H%M%S")
         path = results_dir / f"{ts}.md"
         path.write_text(content, encoding="utf-8")
         return path
 
     def list_results(self, name: str) -> list[Path]:
-        results_dir = self.get_expert_dir(name) / "results"
+        results_dir = self.get_agent_dir(name) / "results"
         if not results_dir.exists():
             return []
         return sorted(results_dir.glob("*.md"), reverse=True)
 
     # ── Orchestrator summary ─────────────────────────────────────────────
 
-    def build_expert_summary(self) -> str:
-        """Build an XML summary of all experts for the orchestrator's system prompt."""
-        experts = self.list_experts()
-        if not experts:
+    def build_agent_summary(self) -> str:
+        """Build an XML summary of all subagents for the orchestrator's system prompt."""
+        agents = self.list_agents()
+        if not agents:
             return ""
 
         def esc(s: str) -> str:
             return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
-        lines = ["<expert_library>"]
-        for e in experts:
-            name = esc(e["name"])
-            desc = esc(e.get("description", e["name"]))
-            times = e.get("times_used", 0)
-            last = e.get("last_used", "never")
-            tags = esc(e.get("tags", ""))
-            lines.append(f'  <expert>')
+        lines = ["<agent_library>"]
+        for a in agents:
+            name = esc(a["name"])
+            desc = esc(a.get("description", a["name"]))
+            times = a.get("times_used", 0)
+            last = a.get("last_used", "never")
+            tags = esc(a.get("tags", ""))
+            lines.append(f'  <agent>')
             lines.append(f'    <name>{name}</name>')
             lines.append(f'    <description>{desc}</description>')
             lines.append(f'    <times_used>{times}</times_used>')
             lines.append(f'    <last_used>{last}</last_used>')
             lines.append(f'    <tags>{tags}</tags>')
-            lines.append(f'  </expert>')
-        lines.append("</expert_library>")
+            lines.append(f'  </agent>')
+        lines.append("</agent_library>")
         return "\n".join(lines)
 
-    # ── Expert creation helpers ──────────────────────────────────────────
+    # ── Agent creation helpers ────────────────────────────────────────────
 
-    def create_expert(
+    def create_agent(
         self,
         name: str,
         description: str,
@@ -462,7 +457,7 @@ This file contains lessons learned from previous task executions.
         tools_used: list[str] | None = None,
         skills_used: list[str] | None = None,
     ) -> None:
-        """Create a new expert with profile, empty memory, soul, experience, and registry entry."""
+        """Create a new subagent with profile, expert memory/soul, evaluator dirs, and registry."""
         now = datetime.now()
         now_str = now.strftime("%Y-%m-%d %H:%M")
 
@@ -480,9 +475,8 @@ This file contains lessons learned from previous task executions.
 ## Past Tasks
 - {task} ({now_str}, success)
 """
-        self.save_expert_profile(name, profile)
+        self.save_agent_profile(name, profile)
 
-        # Initialize memory files
         ensure_dir(self._memory_dir(name))
         mem_path = self._memory_dir(name) / "MEMORY.md"
         if not mem_path.exists():
@@ -491,15 +485,13 @@ This file contains lessons learned from previous task executions.
         if not hist_path.exists():
             hist_path.write_text("", encoding="utf-8")
 
-        # Initialize soul and experience
         self.init_expert_soul(name)
         self.init_expert_experience(name)
 
-        ensure_dir(self.get_expert_dir(name) / "results")
-        ensure_dir(self.get_expert_dir(name) / "expert" / "workspace")
-        ensure_dir(self.get_expert_dir(name) / "expert" / "sessions")
+        ensure_dir(self.get_agent_dir(name) / "results")
+        ensure_dir(self.get_agent_dir(name) / "expert" / "workspace")
+        ensure_dir(self.get_agent_dir(name) / "expert" / "sessions")
 
-        # Initialize evaluator dirs
         self._init_evaluator_dirs(name)
 
         self.update_registry_entry(
@@ -513,10 +505,10 @@ This file contains lessons learned from previous task executions.
             skills_used=skills_used or [],
         )
 
-        logger.info("Created expert profile: {}", name)
+        logger.info("Created subagent: {}", name)
 
     def record_usage(self, name: str) -> None:
-        """Increment times_used and update last_used for an existing expert."""
+        """Increment times_used and update last_used for an existing subagent."""
         registry = self.load_registry()
         entry = registry.get(name, {})
         entry["times_used"] = entry.get("times_used", 0) + 1

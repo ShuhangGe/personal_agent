@@ -8,7 +8,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
-from nanobot.agent.expert_library import ExpertLibrary
+from nanobot.agent.agent_library import AgentLibrary
 from nanobot.agent.memory import MemoryStore
 from nanobot.agent.skills import SkillsLoader
 from nanobot.utils.helpers import build_assistant_message, detect_image_mime
@@ -27,11 +27,11 @@ class ContextBuilder:
         self.workspace = workspace
         self.memory = MemoryStore(workspace)
         self.skills = SkillsLoader(workspace)
-        self.expert_library = ExpertLibrary(workspace)
+        self.agent_library = AgentLibrary(workspace)
         self.enhanced_memory = enhanced_memory
 
     def build_system_prompt(self, skill_names: list[str] | None = None, query: str | None = None) -> str:
-        """Build the orchestrator system prompt: identity, memory, expert library (no skills).
+        """Build the orchestrator system prompt: identity, memory, agent library (no skills).
 
         Args:
             skill_names: Optional list of skills to activate
@@ -48,19 +48,19 @@ class ContextBuilder:
         if memory_context:
             parts.append(f"# Memory\n\n{memory_context}")
 
-        expert_summary = self.expert_library.build_expert_summary()
-        if expert_summary:
-            parts.append(f"""# Expert Library
+        agent_summary = self.agent_library.build_agent_summary()
+        if agent_summary:
+            parts.append(f"""# Agent Library
 
-You have a library of saved experts. When a task matches an existing expert, use its name in the spawn call.
-When no expert matches, omit expert_name to spawn a generic expert (a new expert profile will be saved automatically after the task completes).
+You have a library of saved subagents. When a task matches an existing subagent with matching expertise, use its name in the spawn call.
+When no subagent matches, omit agent_name to spawn a new subagent (a new subagent profile will be saved automatically after the task completes).
 
-{expert_summary}""")
+{agent_summary}""")
         else:
-            parts.append("""# Expert Library
+            parts.append("""# Agent Library
 
-No saved experts yet. When you spawn a task, a generic expert will be used.
-After it completes, a new expert profile will be saved automatically for future reuse.""")
+No saved subagents yet. When you spawn a task, a new subagent will be used.
+After it completes, a new subagent profile will be saved automatically for future reuse.""")
 
         return "\n\n---\n\n".join(parts)
 
@@ -101,23 +101,23 @@ You are nanobot, an orchestrator AI assistant. Your job is to **plan, delegate, 
 Your workspace is at: {workspace_path}
 - Long-term memory: {workspace_path}/memory/MEMORY.md (write important facts here)
 - History log: {workspace_path}/memory/HISTORY.md
-- Expert library: {workspace_path}/agents/
+- Agent library: {workspace_path}/agents/
 
 ## How You Work
 
 1. **Understand** the user's request
-2. **Delegate** by spawning expert subagents via the `spawn` tool
-3. **Monitor** — experts maintain live work logs you can reference
-4. **Respond** — relay expert results to the user naturally
+2. **Delegate** by spawning subagents via the `spawn` tool
+3. **Monitor** — subagents maintain live work logs you can reference
+4. **Respond** — relay subagent results to the user naturally
 
 ## Delegation Rules
 
-- For any task requiring tools (file operations, web search, code execution, etc.), **spawn an expert**.
-- **ONE task = ONE expert.** Give the expert a single, comprehensive task description with ALL the work it needs to do. The expert has its own tools and will figure out the steps itself. Do NOT break a task into micro-steps and spawn separate experts for each step — that creates unnecessary experts and wastes resources.
-- If an expert with matching expertise exists in your library, specify its `expert_name`.
-- If no expert matches, spawn without `expert_name` — a generic expert will handle it and a new profile will be saved.
-- Provide detailed task descriptions and relevant context to experts — they cannot see the conversation.
-- Only spawn multiple experts when subtasks are truly **independent and unrelated** (e.g., "research topic A" and "fix bug in module B"). Sequential steps of the same task must go to ONE expert.
+- For any task requiring tools (file operations, web search, code execution, etc.), **spawn a subagent**.
+- **ONE task = ONE subagent.** Give the subagent a single, comprehensive task description with ALL the work it needs to do. The subagent has its own tools and will figure out the steps itself. Do NOT break a task into micro-steps and spawn separate subagents for each step — that creates unnecessary subagents and wastes resources.
+- If a subagent with matching expertise exists in your library, specify its `agent_name`.
+- If no subagent matches, spawn without `agent_name` — a new subagent will handle it and a new profile will be saved.
+- Provide detailed task descriptions and relevant context to subagents — they cannot see the conversation.
+- Only spawn multiple subagents when subtasks are truly **independent and unrelated** (e.g., "research topic A" and "fix bug in module B"). Sequential steps of the same task must go to ONE subagent.
 
 ## Fast Path (respond directly)
 
@@ -125,13 +125,13 @@ For these, respond directly WITHOUT spawning:
 - Greetings, acknowledgments, thanks
 - Simple clarifying questions
 - Explaining what you've done or plan to do
-- Relaying expert results to the user
+- Relaying subagent results to the user
 
 ## Guidelines
 - State intent before delegating, but NEVER predict results before receiving them.
 - Ask for clarification when the request is ambiguous.
-- When an expert reports back, relay the result naturally to the user.
-- If the user wants details, point them to the expert's result file or work log."""
+- When a subagent reports back, relay the result naturally to the user.
+- If the user wants details, point them to the subagent's result file or work log."""
 
     @staticmethod
     def _build_runtime_context(channel: str | None, chat_id: str | None) -> str:

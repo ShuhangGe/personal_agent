@@ -4,7 +4,19 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Nanobot is a personal AI agent framework forked from https://github.com/HKUDS/nanobot, being customized into a personal agent. It uses an **orchestrator + expert subagent** architecture where a main agent loop delegates tasks to specialized expert subagents that execute with isolated workspaces and persistent memory.
+Nanobot is a personal AI agent framework forked from https://github.com/HKUDS/nanobot, being customized into a personal agent. It uses an **orchestrator + subagent** architecture where a main agent loop delegates tasks to specialized subagents.
+
+## Critical Architecture Concept
+
+**A subagent is NOT an expert. A subagent HAS an expert and an evaluator.**
+
+Each subagent is a paired unit with two roles:
+- **Expert**: executes the actual task (has tools, writes files, runs code)
+- **Evaluator**: reviews the expert's output, maintains guardrails, pushes for quality
+
+The on-disk directory `agents/{name}/` represents a **subagent**, not an expert.
+
+**Naming must be meaningful**: Every subagent must get a short, descriptive, English kebab-case name that relates to its task (e.g. `novel-analyzer`, `web-scraper`). Random hashes or task dumps as names are never acceptable.
 
 ## Running and Testing
 
@@ -23,32 +35,42 @@ Config lives at `~/.nanobot/config.json`. Workspace defaults to `~/.nanobot/work
 
 ## Architecture
 
-### Orchestrator + Expert Pattern
+### Orchestrator + Subagent Pattern
 
-The system has two levels of agents:
+The system has two levels:
 
-- **Orchestrator** (`nanobot/agent/loop.py`): The `AgentLoop` class. Receives messages from channels, builds context (history + memory + expert library), calls the LLM with a minimal tool set (`spawn`, `message`, `cron`), and delegates real work to expert subagents via `spawn`.
+- **Orchestrator** (`nanobot/agent/loop.py`): The `AgentLoop` class. Receives messages from channels, builds context (history + memory + agent library), calls the LLM with a minimal tool set (`spawn`, `message`, `cron`), and delegates real work to subagents via `spawn`.
 
-- **Expert Subagents** (`nanobot/agent/subagent.py`): The `SubagentManager` class. Each expert gets an isolated workspace, its own session history, and persistent memory files. Experts are spawned as background `asyncio.Task`s and announce results back via the message bus.
+- **Subagents** (`nanobot/agent/subagent.py`): The `SubagentManager` class. Each subagent gets an isolated workspace, its own session history, and persistent memory. Subagents are spawned as background `asyncio.Task`s and announce results back via the message bus.
 
-### Expert Memory and Workspace
+### Subagent Structure
 
-Each expert lives in `experts/{name}/` with this structure:
+Each subagent lives in `agents/{name}/` with this structure:
 ```
-experts/{name}/
-├── EXPERT.md           # Profile (description, approach, tags)
+agents/{name}/
+├── AGENT.md            # Profile (description, approach, tags)
 ├── WORKLOG.md          # Live work log during execution
-├── memory/
-│   ├── MEMORY.md       # Persistent knowledge (what works/doesn't)
-│   ├── HISTORY.md      # Grep-searchable task log
-│   ├── SOUL.md         # Expert's identity and personality
-│   └── EXPERIENCE.md   # Lessons learned from previous runs
-├── workspace/          # Isolated file sandbox
-├── sessions/           # Persistent conversation history
-└── results/            # Timestamped result files
+├── results/
+│   └── {timestamp}.md  # Detailed result files
+├── expert/             # The expert half (executes tasks)
+│   ├── workspace/      # Isolated file sandbox
+│   ├── sessions/       # Persistent conversation history
+│   └── memory/
+│       ├── MEMORY.md   # Persistent knowledge (what works)
+│       ├── HISTORY.md  # Grep-searchable task log
+│       ├── SOUL.md     # Expert's identity and personality
+│       └── EXPERIENCE.md # Lessons learned
+└── evaluator/          # The evaluator half (reviews quality)
+    ├── workspace/      # Evaluator's own file sandbox
+    ├── sessions/       # Evaluator conversation history
+    └── memory/
+        ├── MEMORY.md   # Evaluation patterns
+        ├── SOUL.md     # Evaluator personality
+        ├── EXPERIENCE.md # Evaluation history
+        └── GUARDRAILS.md # Rules the expert must follow (read-only for expert)
 ```
 
-Managed by `ExpertLibrary` in `nanobot/agent/expert_library.py`. Experts are created automatically after first task completion via LLM-generated profiles.
+Managed by `AgentLibrary` in `nanobot/agent/agent_library.py`. Subagents are created automatically after first task completion via LLM-generated profiles.
 
 ### Memory System
 
@@ -57,6 +79,15 @@ Two layers coexist:
 - **Base memory** (`nanobot/agent/memory.py`): `MemoryStore` (MEMORY.md + HISTORY.md file I/O) and `MemoryConsolidator` (LLM-based consolidation that triggers when context approaches token limits).
 
 - **Enhanced memory** (`nanobot/agent/enhanced_memory/`): `EnhancedMemoryConsolidator` extends the base consolidator with vector search. Uses Ollama embeddings (`qwen3-embedding:0.6b`) for semantic similarity and sqlite-vec for storage. The agent loop initializes this by default, falling back to the base consolidator if Ollama is unavailable.
+
+### Guardrails System
+
+The evaluator maintains a `GUARDRAILS.md` file per subagent that captures:
+- **Failed approaches** that the expert must not repeat
+- **Anti-patterns** discovered during reviews
+- **Quality standards** that must be maintained
+
+The expert loads guardrails at the start of every run but cannot modify them. Only the evaluator updates guardrails after each review (both GOOD and NOT GOOD verdicts).
 
 ### Message Bus
 
@@ -79,7 +110,7 @@ Tools are subclasses of `Tool` (`nanobot/agent/tools/base.py`) registered in a `
 
 ### Context Building
 
-`nanobot/agent/context.py` — `ContextBuilder` assembles the system prompt from: identity files (AGENTS.md, SOUL.md, USER.md, TOOLS.md), long-term memory, expert library summary, and active skills.
+`nanobot/agent/context.py` — `ContextBuilder` assembles the system prompt from: identity files (AGENTS.md, SOUL.md, USER.md, TOOLS.md), long-term memory, agent library summary, and active skills.
 
 ### Skills
 
@@ -87,7 +118,7 @@ Tools are subclasses of `Tool` (`nanobot/agent/tools/base.py`) registered in a `
 
 ### Session Management
 
-`nanobot/session/` — `SessionManager` persists conversation history as JSON. Each expert has its own session that persists across runs.
+`nanobot/session/` — `SessionManager` persists conversation history as JSON. Each subagent's expert and evaluator have their own sessions that persist across runs.
 
 ## Configuration
 
@@ -102,8 +133,9 @@ Config auto-migrates old formats. Provider matching uses keyword detection again
 ## Key Conventions
 
 - **Async-first**: All I/O is async. Use `asyncio.create_task` for background work.
-- **Workspace isolation**: Experts operate in `experts/{name}/workspace/`. Filesystem tools are sandboxed to this directory.
+- **Workspace isolation**: The expert half operates in `agents/{name}/expert/workspace/`. Filesystem tools are sandboxed to this directory. The evaluator has its own workspace under `agents/{name}/evaluator/workspace/`.
 - **Type hints throughout**: Pydantic models for config, dataclasses for events, type annotations on all functions.
 - **Loguru for logging**: `from loguru import logger` everywhere.
 - **LLM tool calls**: Tool definitions use OpenAI function-calling format. The `chat_with_retry` method on providers handles retries.
-- **Expert lifecycle**: First spawn creates a generic expert (`_task-{id}` temp dir). After completion, LLM generates a profile and the temp dir is migrated to a named expert directory.
+- **Subagent lifecycle**: First spawn creates a temp subagent (`_task-{id}` dir). After completion, LLM generates a profile and the temp dir is migrated to a named subagent directory.
+- **Terminology**: "subagent" or "agent" = the whole entity (expert + evaluator). "expert" = the worker half only. Never use "expert" to mean the whole subagent.

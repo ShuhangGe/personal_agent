@@ -37,10 +37,10 @@ class AgentLoop:
 
     It:
     1. Receives messages from the bus
-    2. Builds context with history, memory, and expert library
+    2. Builds context with history, memory, and agent library
     3. Calls the LLM (with only spawn/message/cron tools)
-    4. Delegates real work to expert subagents via spawn
-    5. Relays expert results back to the user
+    4. Delegates real work to subagents via spawn
+    5. Relays subagent results back to the user
     """
 
     _TOOL_RESULT_MAX_CHARS = 16_000
@@ -123,7 +123,7 @@ class AgentLoop:
     def _register_default_tools(self) -> None:
         """Register orchestrator tools only: spawn, message, cron.
 
-        The orchestrator delegates all real work to expert subagents.
+        The orchestrator delegates all real work to subagents.
         It does NOT have filesystem, exec, or web tools.
         """
         self.tools.register(MessageTool(send_callback=self.bus.publish_outbound))
