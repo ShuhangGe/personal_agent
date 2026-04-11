@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-import shutil
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -26,42 +25,6 @@ from nanobot.providers.base import LLMProvider
 from nanobot.session.manager import Session, SessionManager
 from nanobot.utils.helpers import build_assistant_message, ensure_dir
 
-
-_SAVE_AGENT_PROFILE_TOOL = [
-    {
-        "type": "function",
-        "function": {
-            "name": "save_agent_profile",
-            "description": "Save a new subagent profile based on the completed task.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "agent_name": {
-                        "type": "string",
-                        "description": "Short kebab-case name for this subagent (e.g. 'scrape-product-prices')",
-                    },
-                    "description": {
-                        "type": "string",
-                        "description": "One-sentence description of what this expert does",
-                    },
-                    "tags": {
-                        "type": "string",
-                        "description": "Comma-separated tags for matching future tasks",
-                    },
-                    "approach": {
-                        "type": "string",
-                        "description": "Brief description of the approach and steps that worked",
-                    },
-                    "memory_notes": {
-                        "type": "string",
-                        "description": "Key facts learned during this task worth remembering for next time",
-                    },
-                },
-                "required": ["agent_name", "description", "tags", "approach"],
-            },
-        },
-    }
-]
 
 _TOOL_RESULT_MAX_CHARS = 16_000
 _MAX_EVAL_ROUNDS = 5
@@ -167,13 +130,16 @@ class SubagentManager:
         interrupt_event = asyncio.Event()
         self._interrupt_events[task_id] = interrupt_event
 
-        # Resolve the subagent's isolated workspace and session storage.
-        temp_name = f"_task-{task_id}"
-        agent_dir_name = agent_name if (agent_name and self.agent_library.agent_exists(agent_name)) else temp_name
-
-        # Migrate old flat layout if needed
+        # Resolve the agent directory name at spawn time — no temp dirs.
         if agent_name and self.agent_library.agent_exists(agent_name):
+            # Reusing an existing agent
+            agent_dir_name = agent_name
             self.agent_library._migrate_flat_to_nested(agent_name)
+        elif suggested_name:
+            sanitized = self._sanitize_agent_name(suggested_name)
+            agent_dir_name = sanitized if sanitized else self._derive_name_from_task(task, [])
+        else:
+            agent_dir_name = self._derive_name_from_task(task, [])
 
         expert_workspace = self.agent_library.get_expert_workspace(agent_dir_name)
         evaluator_workspace = self.agent_library.get_evaluator_workspace(agent_dir_name)
@@ -330,9 +296,9 @@ class SubagentManager:
             )
 
             # Post-completion: create/update expert profile and memory
-            created_name = await self._post_completion(
-                agent_name=effective_agent_name,
-                temp_name=temp_name,
+            await self._post_completion(
+                agent_dir_name=agent_dir_name,
+                is_reuse=bool(effective_agent_name and self.agent_library.agent_exists(effective_agent_name)),
                 task=task,
                 final_result=final_result,
                 tools_used=list(set(tools_used)),
@@ -340,16 +306,8 @@ class SubagentManager:
                 eval_verdict=verdict,
                 eval_rounds=eval_round,
                 evaluator_feedback=evaluator_feedback,
-                suggested_name=suggested_name,
                 suggested_description=suggested_description,
             )
-
-            # If a new subagent was created from a temp task, update paths
-            if created_name and created_name != agent_dir_name:
-                new_results = self.agent_library.list_results(created_name)
-                if new_results:
-                    result_path = new_results[0]
-                worklog_path = self.agent_library.get_worklog_path(created_name)
 
             logger.info(
                 "Subagent [{}] done: verdict={}, rounds={}, {:.0f}s",
@@ -366,6 +324,11 @@ class SubagentManager:
         except Exception as e:
             error_msg = f"Error: {e}"
             logger.error("Subagent [{}] failed: {}", task_id, e)
+
+            # Ensure the agent profile exists even on error
+            self._ensure_agent_profile(
+                agent_dir_name, task, suggested_description,
+            )
 
             result_path, worklog_path = self._save_task_artifacts(
                 agent_name=agent_dir_name,
@@ -675,29 +638,26 @@ This is your own workspace for writing notes or analysis files.
 """]
 
         # Load evaluator soul, memory, experience if expert exists
-        agent_name = None
-        # Extract the actual expert name (strip _task- prefix for temp dirs)
-        if not agent_dir_name.startswith("_task-"):
-            agent_name = agent_dir_name
+        resolved_name = agent_dir_name if self.agent_library.agent_exists(agent_dir_name) else None
 
-        if agent_name and self.agent_library.agent_exists(agent_name):
-            soul = self.agent_library.load_evaluator_soul(agent_name)
+        if resolved_name and self.agent_library.agent_exists(resolved_name):
+            soul = self.agent_library.load_evaluator_soul(resolved_name)
             if soul:
                 parts.append(f"## Your Identity (Soul)\n\n{soul}")
 
-            memory = self.agent_library.load_evaluator_memory(agent_name)
+            memory = self.agent_library.load_evaluator_memory(resolved_name)
             if memory:
                 parts.append(f"## Your Memory\n\n{memory}")
 
-            experience = self.agent_library.load_evaluator_experience(agent_name)
+            experience = self.agent_library.load_evaluator_experience(resolved_name)
             if experience:
                 parts.append(f"## Your Experience\n\n{experience}")
 
-            guardrails = self.agent_library.load_evaluator_guardrails(agent_name)
+            guardrails = self.agent_library.load_evaluator_guardrails(resolved_name)
             if guardrails:
                 parts.append(f"## Current Guardrails (you maintain this)\n\n{guardrails}")
 
-            preferences = self.agent_library.load_evaluator_preferences(agent_name)
+            preferences = self.agent_library.load_evaluator_preferences(resolved_name)
             if preferences:
                 parts.append(f"## User Preferences (you maintain this)\n\n{preferences}")
 
@@ -855,8 +815,8 @@ Task ID: {task_id}
 
     async def _post_completion(
         self,
-        agent_name: str | None,
-        temp_name: str,
+        agent_dir_name: str,
+        is_reuse: bool,
         task: str,
         final_result: str,
         tools_used: list[str],
@@ -864,236 +824,52 @@ Task ID: {task_id}
         eval_verdict: str = "",
         eval_rounds: int = 0,
         evaluator_feedback: str = "",
-        suggested_name: str | None = None,
         suggested_description: str | None = None,
-    ) -> str | None:
-        """After task completion: create new expert or update existing one's memory.
+    ) -> None:
+        """After task completion: create new agent profile or update existing one's memory.
 
-        Also updates evaluator memory and guardrails.
-        Returns the created expert name if a new expert was born, else None.
+        The directory already exists with a meaningful name (resolved at spawn time).
+        This method writes AGENT.md if missing, then updates memory.
         """
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
 
-        if agent_name and self.agent_library.agent_exists(agent_name):
-            self.agent_library.record_usage(agent_name)
+        if is_reuse:
+            self.agent_library.record_usage(agent_dir_name)
             self.agent_library.append_expert_history(
-                agent_name,
+                agent_dir_name,
                 f"[{now_str}] Task: {task[:100]} | Tools: {', '.join(tools_used)} | Status: {status} | Eval: {eval_verdict} ({eval_rounds} rounds)",
             )
-            await self._update_expert_memory(agent_name, task, final_result)
-            await self._update_expert_experience(agent_name, task, final_result, status)
-            await self._update_evaluator_memory(agent_name, task, final_result, eval_verdict, eval_rounds)
-            await self._update_evaluator_guardrails(
-                agent_name, task, final_result, eval_verdict, eval_rounds, evaluator_feedback,
-            )
-            return None
+            await self._update_expert_memory(agent_dir_name, task, final_result)
+            await self._update_expert_experience(agent_dir_name, task, final_result, status)
         else:
-            created_name = await self._create_agent_from_task(
-                task, final_result, tools_used, temp_name,
-                suggested_name=suggested_name,
-                suggested_description=suggested_description,
-            )
-            if created_name:
-                await self._update_evaluator_memory(created_name, task, final_result, eval_verdict, eval_rounds)
-                await self._update_evaluator_guardrails(
-                    created_name, task, final_result, eval_verdict, eval_rounds, evaluator_feedback,
-                )
-            return created_name
+            # New agent — ensure profile exists (may already be written by error handler)
+            self._ensure_agent_profile(agent_dir_name, task, suggested_description)
 
-    async def _create_agent_from_task(
+        # Always update evaluator state
+        await self._update_evaluator_memory(agent_dir_name, task, final_result, eval_verdict, eval_rounds)
+        await self._update_evaluator_guardrails(
+            agent_dir_name, task, final_result, eval_verdict, eval_rounds, evaluator_feedback,
+        )
+
+    def _ensure_agent_profile(
         self,
+        agent_dir_name: str,
         task: str,
-        result: str,
-        tools_used: list[str],
-        temp_name: str,
-        suggested_name: str | None = None,
         suggested_description: str | None = None,
-    ) -> str | None:
-        """Use LLM to generate a new subagent profile, then migrate temp data to it.
+    ) -> None:
+        """Write AGENT.md and initialize agent files if they don't exist yet."""
+        if self.agent_library.agent_exists(agent_dir_name):
+            return
 
-        If the orchestrator provided suggested_name (and it passes sanitization),
-        use it directly — skip the LLM naming call entirely. Still use LLM to
-        generate tags/approach/memory_notes from the task result.
-        """
-        # Fast path: orchestrator provided a valid name
-        sanitized = self._sanitize_agent_name(suggested_name) if suggested_name else None
-        if sanitized:
-            # Use LLM only for tags, approach, and memory_notes from the result
-            tags, approach, memory_notes = await self._generate_profile_details(
-                task, result, tools_used,
-            )
-            description = suggested_description or f"Subagent for: {task[:80]}"
-            self.agent_library.create_agent(
-                name=sanitized,
-                description=description,
-                tags=tags,
-                task=task,
-                approach=approach,
-                tools_used=tools_used,
-            )
-            if memory_notes:
-                self.agent_library.save_expert_memory(sanitized, memory_notes)
-            self._migrate_temp_to_agent(temp_name, sanitized)
-            logger.info("Created new subagent from suggested name: {}", sanitized)
-            return sanitized
-
-        # Fallback: full LLM-based naming
-        prompt = f"""A task was just completed. Create a subagent profile for this type of work.
-
-Task: {task}
-
-Result summary: {result[:500]}
-
-Tools used: {', '.join(tools_used)}
-
-Call the save_agent_profile tool with:
-- agent_name: 2-3 word English name in kebab-case describing the subagent's general purpose.
-  Keep it SHORT (max 30 chars). Examples: 'novel-analyzer', 'web-scraper', 'code-reviewer'.
-  NEVER use Chinese or other non-ASCII characters.
-- description: one sentence about this subagent's GENERAL capability (not this specific task).
-  Example: 'Analyzes novels and long-form fiction' not 'Analyzed the novel XYZ by author ABC'
-- tags: comma-separated domain keywords for matching similar future tasks.
-  Example: 'novel, fiction, literature, analysis'
-- approach: brief description of the approach that worked
-- memory_notes: key facts learned that should be remembered for next time
-
-If you cannot call the tool, respond ONLY with a JSON object containing these fields."""
-
-        messages = [
-            {"role": "system", "content": "You create subagent profiles from completed tasks. Call the save_agent_profile tool. The agent_name MUST be short English kebab-case only. The description must describe a GENERAL capability, not this specific task. If you cannot call tools, respond with a JSON object instead."},
-            {"role": "user", "content": prompt},
-        ]
-
-        try:
-            response = await self.provider.chat_with_retry(
-                messages=messages,
-                tools=_SAVE_AGENT_PROFILE_TOOL,
-                model=self.model,
-                tool_choice={"type": "function", "function": {"name": "save_agent_profile"}},
-            )
-
-            args: dict[str, Any] | None = None
-
-            if response.has_tool_calls:
-                args = response.tool_calls[0].arguments
-                if isinstance(args, str):
-                    args = json.loads(args)
-                if isinstance(args, list):
-                    args = args[0] if args else {}
-            elif response.content:
-                # Some models don't support tool_choice — try parsing text as JSON
-                args = self._extract_json_from_text(response.content)
-                if args:
-                    logger.info("Subagent profile creation: extracted profile from text response (model may not support tool_choice)")
-
-            if not args or not isinstance(args, dict):
-                logger.warning("Subagent profile creation: no valid profile data, using fallback")
-                return self._create_fallback_agent(task, tools_used, temp_name)
-
-            name = args.get("agent_name", "").strip()
-            if not name:
-                logger.warning("Subagent profile creation: empty agent_name, using fallback")
-                return self._create_fallback_agent(task, tools_used, temp_name)
-
-            name = self._sanitize_agent_name(name)
-            if not name:
-                return self._create_fallback_agent(task, tools_used, temp_name)
-
-            tags = [t.strip() for t in args.get("tags", "").split(",") if t.strip()]
-
-            self.agent_library.create_agent(
-                name=name,
-                description=args.get("description", ""),
-                tags=tags,
-                task=task,
-                approach=args.get("approach", ""),
-                tools_used=tools_used,
-            )
-
-            memory_notes = args.get("memory_notes", "")
-            if memory_notes:
-                self.agent_library.save_expert_memory(name, memory_notes)
-
-            # Migrate temp workspace, sessions, results to the new subagent directory
-            self._migrate_temp_to_agent(temp_name, name)
-
-            logger.info("Created new subagent from task: {}", name)
-            return name
-
-        except Exception:
-            logger.exception("Failed to create subagent profile from task, using fallback")
-            return self._create_fallback_agent(task, tools_used, temp_name)
-
-    @staticmethod
-    def _extract_json_from_text(text: str) -> dict[str, Any] | None:
-        """Try to extract a JSON object from LLM text when tool calling fails."""
-        # Try the whole text first
-        try:
-            data = json.loads(text.strip())
-            if isinstance(data, dict) and "agent_name" in data:
-                return data
-        except (json.JSONDecodeError, ValueError):
-            pass
-        # Try to find a JSON block in the text
-        match = re.search(r"\{[^{}]*\"agent_name\"[^{}]*\}", text, re.DOTALL)
-        if match:
-            try:
-                return json.loads(match.group())
-            except (json.JSONDecodeError, ValueError):
-                pass
-        return None
-
-    async def _generate_profile_details(
-        self,
-        task: str,
-        result: str,
-        tools_used: list[str],
-    ) -> tuple[list[str], str, str]:
-        """Use LLM to generate tags, approach, and memory_notes from a completed task.
-
-        Returns (tags, approach, memory_notes).
-        """
-        prompt = f"""Generate profile details for a subagent based on a completed task.
-
-Task: {task}
-
-Result summary: {result[:500]}
-
-Tools used: {', '.join(tools_used)}
-
-Return a JSON object with:
-- tags: comma-separated domain keywords (e.g. "novel, fiction, literature, analysis")
-- approach: brief description of the approach that worked (1-2 sentences)
-- memory_notes: key facts learned that should be remembered (2-3 sentences)
-
-Return ONLY the JSON object."""
-
-        messages = [
-            {"role": "system", "content": "You generate subagent profile details. Return only a JSON object with tags, approach, and memory_notes."},
-            {"role": "user", "content": prompt},
-        ]
-
-        try:
-            response = await self.provider.chat_with_retry(
-                messages=messages, tools=[], model=self.model,
-            )
-            if response.content:
-                data = self._extract_json_from_text(response.content)
-                if not data:
-                    # Try parsing the whole response as JSON
-                    try:
-                        data = json.loads(response.content.strip())
-                    except (json.JSONDecodeError, ValueError):
-                        pass
-                if isinstance(data, dict):
-                    tags = [t.strip() for t in data.get("tags", "").split(",") if t.strip()]
-                    approach = data.get("approach", "")
-                    memory_notes = data.get("memory_notes", "")
-                    return tags, approach, memory_notes
-        except Exception:
-            logger.debug("Failed to generate profile details, using defaults")
-
-        return [], "", ""
+        description = suggested_description or f"Subagent for: {task[:80]}"
+        self.agent_library.create_agent(
+            name=agent_dir_name,
+            description=description,
+            tags=[],
+            task=task,
+            approach="",
+        )
+        logger.info("Created subagent profile: {}", agent_dir_name)
 
     @staticmethod
     def _sanitize_agent_name(name: str) -> str | None:
@@ -1103,32 +879,6 @@ Return ONLY the JSON object."""
         if not re.search(r"[a-z]", name) or len(name) < 2:
             return None
         return name[:30]
-
-    def _create_fallback_agent(
-        self,
-        task: str,
-        tools_used: list[str],
-        temp_name: str,
-    ) -> str | None:
-        """Create a basic subagent profile when LLM profile generation fails.
-
-        Derives a meaningful name from the task's dominant tools and keywords
-        instead of a random hash.
-        """
-        name = self._derive_name_from_task(task, tools_used)
-
-        self.agent_library.create_agent(
-            name=name,
-            description=f"Auto-created subagent for: {task[:100]}",
-            tags=[],
-            task=task,
-            approach="Automatic profile — approach not recorded.",
-            tools_used=tools_used,
-        )
-
-        self._migrate_temp_to_agent(temp_name, name)
-        logger.info("Created fallback subagent profile: {}", name)
-        return name
 
     @staticmethod
     def _derive_name_from_task(task: str, tools_used: list[str]) -> str:
@@ -1161,61 +911,6 @@ Return ONLY the JSON object."""
         # Last resort: agent-{short_hash} for non-English tasks
         short_id = uuid.uuid4().hex[:6]
         return f"agent-{short_id}"
-
-    def _migrate_temp_to_agent(self, temp_name: str, agent_name: str) -> None:
-        """Move workspace, sessions, and results from a temp directory to the new subagent."""
-        temp_dir = self.agent_library.get_agent_dir(temp_name)
-        agent_dir = self.agent_library.get_agent_dir(agent_name)
-
-        if not temp_dir.exists():
-            return
-
-        # Migrate expert and evaluator subdirs (temp was created with nested layout)
-        for subdir in (
-            "expert/workspace", "expert/sessions", "expert/memory",
-            "evaluator/workspace", "evaluator/sessions", "evaluator/memory",
-        ):
-            src = temp_dir / subdir
-            dst = agent_dir / subdir
-            if not src.exists():
-                continue
-            if dst.exists():
-                for item in src.iterdir():
-                    target = dst / item.name
-                    if not target.exists():
-                        if item.is_dir():
-                            shutil.copytree(str(item), str(target))
-                        else:
-                            shutil.copy2(str(item), str(target))
-            else:
-                shutil.copytree(str(src), str(dst))
-
-        # Migrate results (top-level)
-        for subdir in ("results",):
-            src = temp_dir / subdir
-            dst = agent_dir / subdir
-            if not src.exists():
-                continue
-            if dst.exists():
-                for item in src.iterdir():
-                    target = dst / item.name
-                    if not target.exists():
-                        shutil.copy2(str(item), str(target))
-            else:
-                shutil.copytree(str(src), str(dst))
-
-        # Copy worklog if it exists
-        temp_worklog = temp_dir / "WORKLOG.md"
-        if temp_worklog.exists():
-            agent_worklog = agent_dir / "WORKLOG.md"
-            if not agent_worklog.exists():
-                shutil.copy2(str(temp_worklog), str(agent_worklog))
-
-        # Clean up temp directory
-        try:
-            shutil.rmtree(str(temp_dir))
-        except OSError:
-            logger.warning("Could not clean up temp subagent dir: {}", temp_dir)
 
     async def _update_expert_memory(
         self,
