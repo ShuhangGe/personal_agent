@@ -16,6 +16,11 @@ class SpawnTool(Tool):
         self._origin_channel = "cli"
         self._origin_chat_id = "direct"
         self._session_key = "cli:direct"
+        self._on_progress = None
+
+    def set_progress_callback(self, callback) -> None:
+        """Set the progress callback for subagent notifications."""
+        self._on_progress = callback
 
     def set_context(self, channel: str, chat_id: str) -> None:
         """Set the origin context for subagent announcements."""
@@ -105,4 +110,5 @@ class SpawnTool(Tool):
             origin_channel=self._origin_channel,
             origin_chat_id=self._origin_chat_id,
             session_key=self._session_key,
+            on_progress=self._on_progress,
         )

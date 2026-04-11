@@ -42,6 +42,8 @@ class AgentDefaults(Base):
     # Deprecated compatibility field: accepted from old configs but ignored at runtime.
     memory_window: int | None = Field(default=None, exclude=True)
     reasoning_effort: str | None = None  # low / medium / high — enables LLM thinking mode
+    feedback_enabled: bool = True  # Enable user feedback loop after subagent results
+    max_feedback_rounds: int = 2  # Max revision rounds when user rejects result
 
     @property
     def should_warn_deprecated_memory_window(self) -> bool:

@@ -94,6 +94,8 @@ class SubagentManager:
         self.agent_library = AgentLibrary(workspace)
         self._running_tasks: dict[str, asyncio.Task[None]] = {}
         self._session_tasks: dict[str, set[str]] = {}
+        self._interrupt_events: dict[str, asyncio.Event] = {}
+        self._pending_interrupts: dict[str, str] = {}
 
     async def spawn(
         self,
@@ -106,6 +108,7 @@ class SubagentManager:
         origin_channel: str = "cli",
         origin_chat_id: str = "direct",
         session_key: str | None = None,
+        on_progress: Any = None,
     ) -> str:
         """Spawn a subagent to execute a task in the background."""
         task_id = str(uuid.uuid4())[:8]
@@ -117,6 +120,7 @@ class SubagentManager:
                 task_id, task, display_label, origin, agent_name, context,
                 suggested_name=suggested_name,
                 suggested_description=suggested_description,
+                on_progress=on_progress,
             )
         )
         self._running_tasks[task_id] = bg_task
@@ -149,12 +153,17 @@ class SubagentManager:
         context: str | None = None,
         suggested_name: str | None = None,
         suggested_description: str | None = None,
+        on_progress: Any = None,
     ) -> None:
         """Execute the subagent with evaluator review loop."""
         logger.info("Subagent [{}] starting task: {}", task_id, label)
         tools_used: list[str] = []
         effective_agent_name = agent_name
         start_time = time.monotonic()
+
+        # Set up interrupt mechanism
+        interrupt_event = asyncio.Event()
+        self._interrupt_events[task_id] = interrupt_event
 
         # Resolve the subagent's isolated workspace and session storage.
         temp_name = f"_task-{task_id}"
@@ -270,6 +279,28 @@ class SubagentManager:
                     task_id, eval_round_num, _MAX_EVAL_ROUNDS, verdict,
                 )
 
+                # Per-round progress notification
+                if on_progress:
+                    summary = evaluator_feedback[:200] if evaluator_feedback else "working..."
+                    try:
+                        await on_progress(
+                            f"Round {eval_round_num}/{_MAX_EVAL_ROUNDS}: {verdict}. {summary}"
+                        )
+                    except Exception:
+                        logger.debug("Progress callback failed for [{}]", task_id)
+
+                # Interrupt check (only when verdict is not GOOD)
+                if verdict != "GOOD":
+                    interrupt_evt = self._interrupt_events.get(task_id)
+                    if interrupt_evt:
+                        try:
+                            await asyncio.wait_for(interrupt_evt.wait(), timeout=3.0)
+                            user_feedback = self._pending_interrupts.pop(task_id, "")
+                            if user_feedback:
+                                messages.append({"role": "user", "content": f"User interrupt: {user_feedback}"})
+                        except asyncio.TimeoutError:
+                            pass  # No interrupt, continue normally
+
                 if verdict == "GOOD":
                     break
 
@@ -327,6 +358,7 @@ class SubagentManager:
                 task_id, label, task, result_path, worklog_path, origin,
                 verdict=verdict, eval_rounds=eval_round, elapsed_seconds=elapsed,
                 evaluator_feedback=evaluator_feedback,
+                agent_dir_name=agent_dir_name,
             )
 
         except Exception as e:
@@ -347,6 +379,9 @@ class SubagentManager:
                 task_id, label, task, result_path, worklog_path, origin,
                 verdict="ERROR", eval_rounds=0, elapsed_seconds=time.monotonic() - start_time,
             )
+        finally:
+            self._interrupt_events.pop(task_id, None)
+            self._pending_interrupts.pop(task_id, None)
 
     # ── Tool and prompt building ──────────────────────────────────────────
 
@@ -423,6 +458,11 @@ You MUST follow these rules. You CANNOT modify this file.
 Violating these guardrails will result in a NOT GOOD verdict.
 
 {guardrails}""")
+
+            # Load user preferences (learned by evaluator from past feedback)
+            preferences = self.agent_library.load_evaluator_preferences(agent_name)
+            if preferences:
+                parts.append(f"## User Preferences (from Evaluator — FOLLOW THESE)\n\n{preferences}")
 
         # Load full skills catalog from the main workspace
         skills_loader = SkillsLoader(self.workspace)
@@ -645,6 +685,10 @@ This is your own workspace for writing notes or analysis files.
             guardrails = self.agent_library.load_evaluator_guardrails(agent_name)
             if guardrails:
                 parts.append(f"## Current Guardrails (you maintain this)\n\n{guardrails}")
+
+            preferences = self.agent_library.load_evaluator_preferences(agent_name)
+            if preferences:
+                parts.append(f"## User Preferences (you maintain this)\n\n{preferences}")
 
         parts.append("""## Review Instructions
 
@@ -1369,6 +1413,58 @@ Return the complete updated GUARDRAILS.md content."""
         except Exception:
             logger.exception("Failed to update guardrails for {}", agent_name)
 
+    async def update_evaluator_preferences(
+        self,
+        agent_name: str,
+        feedback: str,
+        verdict: str,
+    ) -> None:
+        """Update PREFERENCES.md based on user feedback.
+
+        Called when the user rejects a result that the evaluator approved.
+        The evaluator reflects on what it missed and records it.
+        """
+        current = self.agent_library.load_evaluator_preferences(agent_name)
+
+        prompt = f"""You maintain a PREFERENCES file that captures this user's likes, dislikes,
+and style preferences. Update it based on their feedback.
+
+## Current Preferences
+{current or "(empty — first feedback)"}
+
+## User Feedback
+{feedback}
+
+## Verdict on Previous Work
+{verdict}
+
+Rules for updating:
+- Keep ALL existing preference entries.
+- Under "Likes": add what the user seems to prefer based on this feedback.
+- Under "Dislikes (Avoid)": add what the user explicitly rejected or complained about.
+- Under "Style Preferences": add any style/format preferences implied by the feedback.
+- Be specific and actionable — the expert will read these to guide its work.
+- Do NOT repeat entries that are already present.
+
+Return the complete updated PREFERENCES.md content."""
+
+        messages = [
+            {"role": "system", "content": "You maintain a user preferences file. Return only the updated preferences content as markdown. Preserve all existing entries."},
+            {"role": "user", "content": prompt},
+        ]
+
+        try:
+            response = await self.provider.chat_with_retry(
+                messages=messages, tools=[], model=self.model,
+            )
+            if response.content and response.content.strip():
+                self.agent_library.save_evaluator_preferences(
+                    agent_name, response.content.strip(),
+                )
+                logger.info("Updated preferences for {} based on user feedback", agent_name)
+        except Exception:
+            logger.exception("Failed to update preferences for {}", agent_name)
+
     # ── Announcement ─────────────────────────────────────────────────────
 
     async def _announce_result(
@@ -1383,6 +1479,7 @@ Return the complete updated GUARDRAILS.md content."""
         eval_rounds: int = 1,
         elapsed_seconds: float = 0.0,
         evaluator_feedback: str = "",
+        agent_dir_name: str = "",
     ) -> None:
         """Announce the subagent's result to the orchestrator via the message bus."""
         if verdict == "ERROR":
@@ -1411,12 +1508,30 @@ Relay this to the user naturally. Include the key issues found. Keep it brief.""
             sender_id="subagent",
             chat_id=f"{origin['channel']}:{origin['chat_id']}",
             content=announce_content,
+            metadata={"_task_id": task_id, "_agent_name": agent_dir_name},
         )
 
         await self.bus.publish_inbound(msg)
         logger.debug("Subagent [{}] announced result to {}:{}", task_id, origin['channel'], origin['chat_id'])
 
     # ── Cancellation ─────────────────────────────────────────────────────
+
+    def interrupt_task(self, task_id: str, feedback: str = "") -> bool:
+        """Interrupt a running subagent with optional user feedback.
+
+        Returns True if the task was found and interrupted.
+        """
+        evt = self._interrupt_events.get(task_id)
+        if evt and not evt.is_set():
+            if feedback:
+                self._pending_interrupts[task_id] = feedback
+            evt.set()
+            return True
+        return False
+
+    def get_session_tasks(self, session_key: str) -> set[str]:
+        """Return the set of task IDs for a given session."""
+        return set(self._session_tasks.get(session_key, set()))
 
     async def cancel_by_session(self, session_key: str) -> int:
         """Cancel all subagents for the given session. Returns count cancelled."""

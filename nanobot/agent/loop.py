@@ -99,6 +99,7 @@ class AgentLoop:
         self._mcp_connecting = False
         self._active_tasks: dict[str, list[asyncio.Task]] = {}  # session_key -> tasks
         self._processing_lock = asyncio.Lock()
+        self._pending_feedback: dict[str, dict] = {}  # session_key -> {"task_id", "agent_name", "round", "max_rounds"}
 
         # Use enhanced memory with Ollama embeddings by default
         self.memory_consolidator = EnhancedMemoryConsolidator(
@@ -159,6 +160,16 @@ class AgentLoop:
             if tool := self.tools.get(name):
                 if hasattr(tool, "set_context"):
                     tool.set_context(channel, chat_id, *([message_id] if name == "message" else []))
+
+        # Wire subagent progress callback to publish outbound messages
+        if spawn_tool := self.tools.get("spawn"):
+            if hasattr(spawn_tool, "set_progress_callback"):
+                spawn_tool.set_progress_callback(
+                    lambda content: self.bus.publish_outbound(OutboundMessage(
+                        channel=channel, chat_id=chat_id, content=content,
+                        metadata={"_progress": True},
+                    ))
+                )
 
     @staticmethod
     def _strip_think(text: str | None) -> str | None:
@@ -387,6 +398,20 @@ class AgentLoop:
             self._save_turn(session, all_msgs, 1 + len(history))
             self.sessions.save(session)
             await self.memory_consolidator.maybe_consolidate_by_tokens(session)
+
+            # Track pending feedback for subagent results
+            task_id = msg.metadata.get("_task_id")
+            agent_name = msg.metadata.get("_agent_name")
+            if task_id and agent_name:
+                self._pending_feedback[key] = {
+                    "task_id": task_id,
+                    "agent_name": agent_name,
+                    "round": 0,
+                    "max_rounds": 2,  # default, will be updated from config when available
+                }
+                # Send feedback prompt as a follow-up outbound message
+                asyncio.create_task(self._send_feedback_prompt(channel, chat_id))
+
             return OutboundMessage(channel=channel, chat_id=chat_id,
                                   content=final_content or "Background task completed.")
 
@@ -395,6 +420,11 @@ class AgentLoop:
 
         key = session_key or msg.session_key
         session = self.sessions.get_or_create(key)
+
+        # Check for pending feedback BEFORE slash commands
+        pending = self._pending_feedback.get(key)
+        if pending and cmd not in ("/new", "/stop", "/restart", "/help"):
+            return await self._handle_feedback_response(msg, pending, key)
 
         # Slash commands
         cmd = msg.content.strip().lower()
@@ -508,6 +538,77 @@ class AgentLoop:
             entry.setdefault("timestamp", datetime.now().isoformat())
             session.messages.append(entry)
         session.updated_at = datetime.now()
+
+    async def _send_feedback_prompt(self, channel: str, chat_id: str) -> None:
+        """Send a feedback prompt after a subagent result."""
+        await asyncio.sleep(0.5)  # Small delay so result arrives first
+        await self.bus.publish_outbound(OutboundMessage(
+            channel=channel, chat_id=chat_id,
+            content="Are you satisfied with this result? Send feedback or say 'yes' to accept.",
+        ))
+
+    async def _handle_feedback_response(
+        self,
+        msg: InboundMessage,
+        pending: dict,
+        session_key: str,
+    ) -> OutboundMessage | None:
+        """Handle user feedback on a subagent result."""
+        content = msg.content.strip().lower()
+        agent_name = pending["agent_name"]
+
+        # User accepts the result
+        if content in ("yes", "ok", "good", "great", "accept", "fine", "done", "looks good"):
+            self._pending_feedback.pop(session_key, None)
+            return OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id,
+                content="Great, result accepted!",
+            )
+
+        # User provides feedback — update preferences and re-spawn
+        round_num = pending["round"] + 1
+        max_rounds = pending["max_rounds"]
+
+        if round_num >= max_rounds:
+            # Max feedback rounds reached — clear pending and suggest
+            self._pending_feedback.pop(session_key, None)
+            return OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id,
+                content=(
+                    "I've noted your feedback. Would you like me to try a different approach? "
+                    "Just describe what you'd like and I'll create a new task."
+                ),
+            )
+
+        # Update preferences via evaluator preference learning
+        await self._update_preferences_from_feedback(agent_name, msg.content, "NOT GOOD")
+
+        # Update pending feedback state
+        pending["round"] = round_num
+
+        # Re-spawn subagent with revision context
+        revision_ctx = (
+            f"User rejected the previous result with this feedback:\n{msg.content}\n\n"
+            f"Please revise the output to address the user's concerns. "
+            f"This is revision round {round_num}/{max_rounds}."
+        )
+        task_id = pending["task_id"]
+        await self.subagents.interrupt_task(task_id, revision_ctx)
+
+        await self.bus.publish_outbound(OutboundMessage(
+            channel=msg.channel, chat_id=msg.chat_id,
+            content=f"Noted. Revising based on your feedback (round {round_num}/{max_rounds})...",
+        ))
+        return None
+
+    async def _update_preferences_from_feedback(
+        self,
+        agent_name: str,
+        feedback: str,
+        verdict: str,
+    ) -> None:
+        """Update evaluator PREFERENCES.md based on user feedback."""
+        await self.subagents.update_evaluator_preferences(agent_name, feedback, verdict)
 
     async def process_direct(
         self,

@@ -332,6 +332,34 @@ but CANNOT modify this file. Updated after every evaluation.
 """
         self.save_evaluator_guardrails(name, content)
 
+    # ── Evaluator preferences (learned from user feedback) ──────────────
+
+    def load_evaluator_preferences(self, name: str) -> str:
+        """Load user preferences learned by the evaluator."""
+        path = self._evaluator_memory_dir(name) / "PREFERENCES.md"
+        if path.exists():
+            return path.read_text(encoding="utf-8")
+        return ""
+
+    def save_evaluator_preferences(self, name: str, content: str) -> None:
+        """Save updated user preferences (evaluator writes, expert reads)."""
+        (self._evaluator_memory_dir(name) / "PREFERENCES.md").write_text(content, encoding="utf-8")
+
+    def init_evaluator_preferences(self, name: str) -> None:
+        """Initialize an empty preferences file for a new subagent."""
+        content = """# User Preferences
+
+## Likes
+
+
+## Dislikes (Avoid)
+
+
+## Style Preferences
+
+"""
+        self.save_evaluator_preferences(name, content)
+
     # ── Migration ────────────────────────────────────────────────────────
 
     def _migrate_flat_to_nested(self, name: str) -> None:
@@ -383,6 +411,8 @@ but CANNOT modify this file. Updated after every evaluation.
             self.init_evaluator_experience(name)
         if not (mem_dir / "GUARDRAILS.md").exists():
             self.init_evaluator_guardrails(name)
+        if not (mem_dir / "PREFERENCES.md").exists():
+            self.init_evaluator_preferences(name)
 
     # ── Worklog ──────────────────────────────────────────────────────────
 
