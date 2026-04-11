@@ -351,15 +351,30 @@ class SubagentManager:
     # ── Tool and prompt building ──────────────────────────────────────────
 
     def _build_expert_tools(self, expert_workspace: Path) -> ToolRegistry:
-        """Build the full tool set, sandboxed to the expert's own workspace."""
+        """Build the full tool set, sandboxed to the expert's own workspace.
+
+        Read-only access is granted to the user's home directory so the expert
+        can read files the user references (e.g. ~/Desktop/some_file.txt).
+        Write/edit remain restricted to the expert workspace.
+        """
+        home_dir = Path.home()
         tools = ToolRegistry()
-        for cls in (ReadFileTool, WriteFileTool, EditFileTool, ListDirTool):
+        # ReadFile and ListDir: can read from home dir (read-only)
+        for cls in (ReadFileTool, ListDirTool):
+            tools.register(cls(
+                workspace=expert_workspace,
+                allowed_dir=expert_workspace,
+                read_only_dirs=[home_dir],
+            ))
+        # Write and Edit: expert workspace only (no change)
+        for cls in (WriteFileTool, EditFileTool):
             tools.register(cls(workspace=expert_workspace, allowed_dir=expert_workspace))
         tools.register(ExecTool(
             working_dir=str(expert_workspace),
             timeout=self.exec_config.timeout,
             restrict_to_workspace=True,
             path_append=self.exec_config.path_append,
+            allowed_read_dirs=[str(home_dir)],
         ))
         tools.register(WebSearchTool(config=self.web_search_config, proxy=self.web_proxy))
         tools.register(WebFetchTool(proxy=self.web_proxy))
