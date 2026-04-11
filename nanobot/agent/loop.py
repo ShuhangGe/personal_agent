@@ -421,13 +421,14 @@ class AgentLoop:
         key = session_key or msg.session_key
         session = self.sessions.get_or_create(key)
 
+        # Slash commands
+        cmd = msg.content.strip().lower()
+
         # Check for pending feedback BEFORE slash commands
         pending = self._pending_feedback.get(key)
         if pending and cmd not in ("/new", "/stop", "/restart", "/help"):
             return await self._handle_feedback_response(msg, pending, key)
 
-        # Slash commands
-        cmd = msg.content.strip().lower()
         if cmd == "/new":
             try:
                 if not await self.memory_consolidator.archive_unconsolidated(session):
