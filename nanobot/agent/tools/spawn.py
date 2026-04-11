@@ -63,6 +63,23 @@ class SpawnTool(Tool):
                     "type": "string",
                     "description": "Relevant conversation context or background info the subagent needs",
                 },
+                "suggested_name": {
+                    "type": "string",
+                    "description": (
+                        "Short kebab-case name for a new subagent (2-3 English words, max 30 chars). "
+                        "Only provide when NOT reusing an existing agent via agent_name. "
+                        "Examples: 'novel-analyzer', 'web-scraper', 'code-reviewer'. "
+                        "Use English only, no special characters."
+                    ),
+                },
+                "suggested_description": {
+                    "type": "string",
+                    "description": (
+                        "One-sentence description of this agent's GENERAL capability (not this specific task). "
+                        "Only provide when NOT reusing an existing agent. "
+                        "Example: 'Analyzes novels and long-form fiction' not 'Analyzes the novel XYZ'"
+                    ),
+                },
             },
             "required": ["task"],
         }
@@ -73,6 +90,8 @@ class SpawnTool(Tool):
         agent_name: str | None = None,
         label: str | None = None,
         context: str | None = None,
+        suggested_name: str | None = None,
+        suggested_description: str | None = None,
         **kwargs: Any,
     ) -> str:
         """Spawn a subagent to execute the given task."""
@@ -81,6 +100,8 @@ class SpawnTool(Tool):
             label=label,
             agent_name=agent_name,
             context=context,
+            suggested_name=suggested_name,
+            suggested_description=suggested_description,
             origin_channel=self._origin_channel,
             origin_chat_id=self._origin_chat_id,
             session_key=self._session_key,

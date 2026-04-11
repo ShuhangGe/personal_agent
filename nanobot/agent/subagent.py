@@ -101,6 +101,8 @@ class SubagentManager:
         label: str | None = None,
         agent_name: str | None = None,
         context: str | None = None,
+        suggested_name: str | None = None,
+        suggested_description: str | None = None,
         origin_channel: str = "cli",
         origin_chat_id: str = "direct",
         session_key: str | None = None,
@@ -111,7 +113,11 @@ class SubagentManager:
         origin = {"channel": origin_channel, "chat_id": origin_chat_id}
 
         bg_task = asyncio.create_task(
-            self._run_subagent(task_id, task, display_label, origin, agent_name, context)
+            self._run_subagent(
+                task_id, task, display_label, origin, agent_name, context,
+                suggested_name=suggested_name,
+                suggested_description=suggested_description,
+            )
         )
         self._running_tasks[task_id] = bg_task
         if session_key:
@@ -127,8 +133,9 @@ class SubagentManager:
         bg_task.add_done_callback(_cleanup)
 
         agent_info = f" (subagent: {agent_name})" if agent_name else " (new subagent)"
-        logger.info("Spawned subagent [{}]{}: {}", task_id, agent_info, display_label)
-        return f"Subagent{agent_info} started for: {display_label} (id: {task_id}). I'll notify you when it completes."
+        name_info = f" as '{suggested_name}'" if suggested_name and not agent_name else ""
+        logger.info("Spawned subagent [{}]{}{}: {}", task_id, agent_info, name_info, display_label)
+        return f"Subagent{agent_info}{name_info} started for: {display_label} (id: {task_id}). I'll notify you when it completes."
 
     # ── Core execution ────────────────────────────────────────────────────
 
@@ -140,6 +147,8 @@ class SubagentManager:
         origin: dict[str, str],
         agent_name: str | None = None,
         context: str | None = None,
+        suggested_name: str | None = None,
+        suggested_description: str | None = None,
     ) -> None:
         """Execute the subagent with evaluator review loop."""
         logger.info("Subagent [{}] starting task: {}", task_id, label)
@@ -298,6 +307,8 @@ class SubagentManager:
                 eval_verdict=verdict,
                 eval_rounds=eval_round,
                 evaluator_feedback=evaluator_feedback,
+                suggested_name=suggested_name,
+                suggested_description=suggested_description,
             )
 
             # If a new subagent was created from a temp task, update paths
@@ -798,6 +809,8 @@ Task ID: {task_id}
         eval_verdict: str = "",
         eval_rounds: int = 0,
         evaluator_feedback: str = "",
+        suggested_name: str | None = None,
+        suggested_description: str | None = None,
     ) -> str | None:
         """After task completion: create new expert or update existing one's memory.
 
@@ -820,7 +833,11 @@ Task ID: {task_id}
             )
             return None
         else:
-            created_name = await self._create_agent_from_task(task, final_result, tools_used, temp_name)
+            created_name = await self._create_agent_from_task(
+                task, final_result, tools_used, temp_name,
+                suggested_name=suggested_name,
+                suggested_description=suggested_description,
+            )
             if created_name:
                 await self._update_evaluator_memory(created_name, task, final_result, eval_verdict, eval_rounds)
                 await self._update_evaluator_guardrails(
@@ -834,8 +851,38 @@ Task ID: {task_id}
         result: str,
         tools_used: list[str],
         temp_name: str,
+        suggested_name: str | None = None,
+        suggested_description: str | None = None,
     ) -> str | None:
-        """Use LLM to generate a new subagent profile, then migrate temp data to it."""
+        """Use LLM to generate a new subagent profile, then migrate temp data to it.
+
+        If the orchestrator provided suggested_name (and it passes sanitization),
+        use it directly — skip the LLM naming call entirely. Still use LLM to
+        generate tags/approach/memory_notes from the task result.
+        """
+        # Fast path: orchestrator provided a valid name
+        sanitized = self._sanitize_agent_name(suggested_name) if suggested_name else None
+        if sanitized:
+            # Use LLM only for tags, approach, and memory_notes from the result
+            tags, approach, memory_notes = await self._generate_profile_details(
+                task, result, tools_used,
+            )
+            description = suggested_description or f"Subagent for: {task[:80]}"
+            self.agent_library.create_agent(
+                name=sanitized,
+                description=description,
+                tags=tags,
+                task=task,
+                approach=approach,
+                tools_used=tools_used,
+            )
+            if memory_notes:
+                self.agent_library.save_expert_memory(sanitized, memory_notes)
+            self._migrate_temp_to_agent(temp_name, sanitized)
+            logger.info("Created new subagent from suggested name: {}", sanitized)
+            return sanitized
+
+        # Fallback: full LLM-based naming
         prompt = f"""A task was just completed. Create a subagent profile for this type of work.
 
 Task: {task}
@@ -848,15 +895,17 @@ Call the save_agent_profile tool with:
 - agent_name: 2-3 word English name in kebab-case describing the subagent's general purpose.
   Keep it SHORT (max 30 chars). Examples: 'novel-analyzer', 'web-scraper', 'code-reviewer'.
   NEVER use Chinese or other non-ASCII characters.
-- description: one sentence about what this subagent does
-- tags: comma-separated keywords for matching similar future tasks
+- description: one sentence about this subagent's GENERAL capability (not this specific task).
+  Example: 'Analyzes novels and long-form fiction' not 'Analyzed the novel XYZ by author ABC'
+- tags: comma-separated domain keywords for matching similar future tasks.
+  Example: 'novel, fiction, literature, analysis'
 - approach: brief description of the approach that worked
 - memory_notes: key facts learned that should be remembered for next time
 
 If you cannot call the tool, respond ONLY with a JSON object containing these fields."""
 
         messages = [
-            {"role": "system", "content": "You create subagent profiles from completed tasks. Call the save_agent_profile tool. The agent_name MUST be short English kebab-case only. If you cannot call tools, respond with a JSON object instead."},
+            {"role": "system", "content": "You create subagent profiles from completed tasks. Call the save_agent_profile tool. The agent_name MUST be short English kebab-case only. The description must describe a GENERAL capability, not this specific task. If you cannot call tools, respond with a JSON object instead."},
             {"role": "user", "content": prompt},
         ]
 
@@ -939,6 +988,58 @@ If you cannot call the tool, respond ONLY with a JSON object containing these fi
                 pass
         return None
 
+    async def _generate_profile_details(
+        self,
+        task: str,
+        result: str,
+        tools_used: list[str],
+    ) -> tuple[list[str], str, str]:
+        """Use LLM to generate tags, approach, and memory_notes from a completed task.
+
+        Returns (tags, approach, memory_notes).
+        """
+        prompt = f"""Generate profile details for a subagent based on a completed task.
+
+Task: {task}
+
+Result summary: {result[:500]}
+
+Tools used: {', '.join(tools_used)}
+
+Return a JSON object with:
+- tags: comma-separated domain keywords (e.g. "novel, fiction, literature, analysis")
+- approach: brief description of the approach that worked (1-2 sentences)
+- memory_notes: key facts learned that should be remembered (2-3 sentences)
+
+Return ONLY the JSON object."""
+
+        messages = [
+            {"role": "system", "content": "You generate subagent profile details. Return only a JSON object with tags, approach, and memory_notes."},
+            {"role": "user", "content": prompt},
+        ]
+
+        try:
+            response = await self.provider.chat_with_retry(
+                messages=messages, tools=[], model=self.model,
+            )
+            if response.content:
+                data = self._extract_json_from_text(response.content)
+                if not data:
+                    # Try parsing the whole response as JSON
+                    try:
+                        data = json.loads(response.content.strip())
+                    except (json.JSONDecodeError, ValueError):
+                        pass
+                if isinstance(data, dict):
+                    tags = [t.strip() for t in data.get("tags", "").split(",") if t.strip()]
+                    approach = data.get("approach", "")
+                    memory_notes = data.get("memory_notes", "")
+                    return tags, approach, memory_notes
+        except Exception:
+            logger.debug("Failed to generate profile details, using defaults")
+
+        return [], "", ""
+
     @staticmethod
     def _sanitize_agent_name(name: str) -> str | None:
         """Sanitize an agent name to short kebab-case ASCII. Returns None if unusable."""
@@ -992,16 +1093,19 @@ If you cannot call the tool, respond ONLY with a JSON object containing these fi
             if tool in tools_used and len(tools_used) <= 2:
                 return hint
 
-        # Extract English words from the task
-        words = re.findall(r"[a-zA-Z]{3,}", task)
+        # Extract English words from the task (NOT file paths)
+        # Only match whole words, not path fragments like 'Users', 'Desktop', etc.
+        skip_words = {"users", "desktop", "home", "nanobot", "workspace", "shuhangge"}
+        words = [w.lower() for w in re.findall(r"\b[a-zA-Z]{3,}\b", task)
+                 if w.lower() not in skip_words]
         if words:
-            slug = "-".join(w.lower() for w in words[:3])
+            slug = "-".join(words[:3])
             slug = slug[:25]
             return slug
 
-        # Last resort
+        # Last resort: agent-{short_hash} for non-English tasks
         short_id = uuid.uuid4().hex[:6]
-        return f"task-{short_id}"
+        return f"agent-{short_id}"
 
     def _migrate_temp_to_agent(self, temp_name: str, agent_name: str) -> None:
         """Move workspace, sessions, and results from a temp directory to the new subagent."""

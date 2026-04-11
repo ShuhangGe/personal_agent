@@ -50,17 +50,12 @@ class ContextBuilder:
 
         agent_summary = self.agent_library.build_agent_summary()
         if agent_summary:
-            parts.append(f"""# Agent Library
-
-You have a library of saved subagents. When a task matches an existing subagent with matching expertise, use its name in the spawn call.
-When no subagent matches, omit agent_name to spawn a new subagent (a new subagent profile will be saved automatically after the task completes).
-
-{agent_summary}""")
+            parts.append(agent_summary)
         else:
-            parts.append("""# Agent Library
+            parts.append("""## Available Agents
 
-No saved subagents yet. When you spawn a task, a new subagent will be used.
-After it completes, a new subagent profile will be saved automatically for future reuse.""")
+No saved subagents yet. When you spawn a task without agent_name, provide suggested_name and suggested_description.
+A new subagent profile will be saved automatically for future reuse.""")
 
         return "\n\n---\n\n".join(parts)
 
@@ -114,10 +109,21 @@ Your workspace is at: {workspace_path}
 
 - For any task requiring tools (file operations, web search, code execution, etc.), **spawn a subagent**.
 - **ONE task = ONE subagent.** Give the subagent a single, comprehensive task description with ALL the work it needs to do. The subagent has its own tools and will figure out the steps itself. Do NOT break a task into micro-steps and spawn separate subagents for each step — that creates unnecessary subagents and wastes resources.
-- If a subagent with matching expertise exists in your library, specify its `agent_name`.
-- If no subagent matches, spawn without `agent_name` — a new subagent will handle it and a new profile will be saved.
 - Provide detailed task descriptions and relevant context to subagents — they cannot see the conversation.
 - Only spawn multiple subagents when subtasks are truly **independent and unrelated** (e.g., "research topic A" and "fix bug in module B"). Sequential steps of the same task must go to ONE subagent.
+
+## Agent Library
+
+When spawning a task:
+1. First check the Available Agents list below. Match by reading each agent's description and tags.
+2. If a match is found, pass its name as `agent_name`.
+3. If no match, omit `agent_name` and provide BOTH `suggested_name` AND `suggested_description`:
+   - suggested_name: 2-3 English words in kebab-case, describing the agent's general purpose
+   - suggested_description: one sentence about what this agent does in general (NOT about this specific task)
+4. Tell the user what you did — e.g. "I'm creating a new agent 'novel-analyzer' for this task since no existing agent handles fiction analysis."
+
+Good suggested_name: "novel-analyzer", "web-scraper", "code-reviewer"
+Bad: "task-123", "analyze-book-chapter-3"
 
 ## Fast Path (respond directly)
 

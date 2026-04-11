@@ -420,29 +420,23 @@ but CANNOT modify this file. Updated after every evaluation.
     # ── Orchestrator summary ─────────────────────────────────────────────
 
     def build_agent_summary(self) -> str:
-        """Build an XML summary of all subagents for the orchestrator's system prompt."""
+        """Build a markdown summary of all subagents for the orchestrator's system prompt."""
         agents = self.list_agents()
         if not agents:
             return ""
 
-        def esc(s: str) -> str:
-            return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-        lines = ["<agent_library>"]
+        lines = ["## Available Agents", ""]
         for a in agents:
-            name = esc(a["name"])
-            desc = esc(a.get("description", a["name"]))
+            name = a["name"]
+            desc = a.get("description", a["name"])
             times = a.get("times_used", 0)
-            last = a.get("last_used", "never")
-            tags = esc(a.get("tags", ""))
-            lines.append(f'  <agent>')
-            lines.append(f'    <name>{name}</name>')
-            lines.append(f'    <description>{desc}</description>')
-            lines.append(f'    <times_used>{times}</times_used>')
-            lines.append(f'    <last_used>{last}</last_used>')
-            lines.append(f'    <tags>{tags}</tags>')
-            lines.append(f'  </agent>')
-        lines.append("</agent_library>")
+            tags = a.get("tags", "")
+            lines.append(f"- **{name}** — {desc}")
+            if tags:
+                lines.append(f"  Tags: {tags} | Used: {times} time{'s' if times != 1 else ''}")
+            else:
+                lines.append(f"  Used: {times} time{'s' if times != 1 else ''}")
+            lines.append("")
         return "\n".join(lines)
 
     # ── Agent creation helpers ────────────────────────────────────────────
