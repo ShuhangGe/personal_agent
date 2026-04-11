@@ -2,6 +2,17 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## CRITICAL — Workflow Rules (READ FIRST)
+
+- **Start of session:** `git fetch origin && git merge origin/main`
+- **Auto-commit after every code change** with Conventional Commits: `type(scope): description` (feat, fix, refactor, perf, docs, chore). No push unless asked.
+- **Worktrees** live under `.claude/worktrees/<taskname>`, branch `<type>/<taskname>`. One per task, clean up when done.
+- **Merge** (never rebase) worktree branches back to main. Resolve conflicts manually.
+- Never commit secrets or `.env`.
+
+### Solved Issues Log
+Before debugging, check `TECHNICAL.md` for known solutions. After solving a non-obvious bug, add an entry: **Status / Symptom / Cause / Fix / Files**.
+
 ## Project Overview
 
 Nanobot is a personal AI agent framework forked from https://github.com/HKUDS/nanobot, being customized into a personal agent. It uses an **orchestrator + subagent** architecture where a main agent loop delegates tasks to specialized subagents.
