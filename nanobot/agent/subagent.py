@@ -65,6 +65,8 @@ _SAVE_AGENT_PROFILE_TOOL = [
 
 _TOOL_RESULT_MAX_CHARS = 16_000
 _MAX_EVAL_ROUNDS = 5
+_MEMORY_MAX_CHARS = 3000
+_GUARDRAILS_MAX_CHARS = 2500
 
 
 class SubagentManager:
@@ -518,6 +520,15 @@ What you're doing now...
    Do NOT include the full detailed results — those are saved separately.
    Just tell the orchestrator: what you did, whether it succeeded, and any key output paths.
 """)
+
+        # Nudge: encourage mid-task knowledge persistence for known agents
+        if agent_dir_name:
+            memory_path = self.agent_library._memory_dir(agent_dir_name) / "MEMORY.md"
+            parts.append(f"""**Knowledge Persistence:**
+5. Your memory file is at: {memory_path}
+   After completing any step where you learned something valuable (a working approach,
+   a pitfall to avoid, a useful API or pattern), update your MEMORY.md using edit_file.
+   Don't wait until the end — save knowledge as you discover it.""")
 
         return "\n\n".join(parts)
 
@@ -1239,7 +1250,9 @@ If nothing new was learned, return the memory unchanged."""
                 messages=messages, tools=[], model=self.model,
             )
             if response.content and response.content.strip():
-                self.agent_library.save_expert_memory(agent_name, response.content.strip())
+                content = response.content.strip()
+                content = await self._consolidate_memory(content, _MEMORY_MAX_CHARS, "expert memory")
+                self.agent_library.save_expert_memory(agent_name, content)
                 logger.debug("Updated memory for expert: {}", agent_name)
         except Exception:
             logger.exception("Failed to update expert memory for {}", agent_name)
@@ -1335,7 +1348,9 @@ Return the updated memory as markdown."""
                 messages=messages, tools=[], model=self.model,
             )
             if response.content and response.content.strip():
-                self.agent_library.save_evaluator_memory(agent_name, response.content.strip())
+                content = response.content.strip()
+                content = await self._consolidate_memory(content, _MEMORY_MAX_CHARS, "evaluator memory")
+                self.agent_library.save_evaluator_memory(agent_name, content)
                 # Also append experience
                 experience_entry = f"""## {now_str}
 
@@ -1406,8 +1421,10 @@ Return the complete updated GUARDRAILS.md content."""
                 messages=messages, tools=[], model=self.model,
             )
             if response.content and response.content.strip():
+                content = response.content.strip()
+                content = await self._consolidate_memory(content, _GUARDRAILS_MAX_CHARS, "guardrails")
                 self.agent_library.save_evaluator_guardrails(
-                    agent_name, response.content.strip(),
+                    agent_name, content,
                 )
                 logger.debug("Updated guardrails for expert: {}", agent_name)
         except Exception:
@@ -1464,6 +1481,40 @@ Return the complete updated PREFERENCES.md content."""
                 logger.info("Updated preferences for {} based on user feedback", agent_name)
         except Exception:
             logger.exception("Failed to update preferences for {}", agent_name)
+
+    # ── Memory consolidation ────────────────────────────────────────────
+
+    async def _consolidate_memory(
+        self,
+        content: str,
+        max_chars: int,
+        label: str,
+    ) -> str:
+        """If content exceeds max_chars, use LLM to compress it."""
+        if len(content) <= max_chars:
+            return content
+
+        prompt = f"""Compress the following {label} to under {max_chars} characters.
+Keep ALL critical facts, rules, and patterns. Remove redundancy and verbosity.
+Return ONLY the compressed content, nothing else.
+
+## Content to Compress ({len(content)} chars)
+{content}"""
+
+        messages = [
+            {"role": "system", "content": f"You compress {label} to fit within a character limit while preserving all essential information."},
+            {"role": "user", "content": prompt},
+        ]
+
+        try:
+            response = await self.provider.chat_with_retry(
+                messages=messages, tools=[], model=self.model,
+            )
+            if response.content and len(response.content.strip()) <= max_chars * 1.1:
+                return response.content.strip()
+        except Exception:
+            logger.debug("Memory consolidation failed, keeping original")
+        return content[:max_chars]
 
     # ── Announcement ─────────────────────────────────────────────────────
 
