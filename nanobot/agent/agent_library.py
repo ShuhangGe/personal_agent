@@ -13,6 +13,8 @@ from loguru import logger
 
 from nanobot.utils.helpers import ensure_dir
 
+_EXPERIENCE_MAX_CHARS = 4000
+
 
 class AgentLibrary:
     """
@@ -192,6 +194,7 @@ class AgentLibrary:
         path = self._memory_dir(name) / "EXPERIENCE.md"
         with open(path, "a", encoding="utf-8") as f:
             f.write(entry.rstrip() + "\n\n")
+        self.rotate_experience(name, memory_type="expert")
 
     def init_expert_experience(self, name: str) -> None:
         """Initialize an empty experience file for a new expert."""
@@ -291,6 +294,42 @@ I use "NOT GOOD" with specific feedback when improvements are needed.
         path = self._evaluator_memory_dir(name) / "EXPERIENCE.md"
         with open(path, "a", encoding="utf-8") as f:
             f.write(entry.rstrip() + "\n\n")
+        self.rotate_experience(name, memory_type="evaluator")
+
+    def rotate_experience(self, name: str, memory_type: str = "expert") -> None:
+        """Trim experience file to stay under the character limit, keeping newest entries."""
+        if memory_type == "expert":
+            path = self._memory_dir(name) / "EXPERIENCE.md"
+        else:
+            path = self._evaluator_memory_dir(name) / "EXPERIENCE.md"
+
+        if not path.exists():
+            return
+
+        content = path.read_text(encoding="utf-8")
+        if len(content) <= _EXPERIENCE_MAX_CHARS:
+            return
+
+        # Split by "---\n" separators, keep newest entries
+        entries = content.split("---\n")
+        header = entries[0] if entries else ""
+        entries = [e for e in entries[1:] if e.strip()]
+
+        result = header.rstrip() + "\n\n"
+        total = len(result)
+        kept: list[str] = []
+        for entry in reversed(entries):
+            if total + len(entry) + 4 > _EXPERIENCE_MAX_CHARS:
+                break
+            kept.append(entry)
+            total += len(entry) + 4
+
+        # Write back: header + kept entries (newest first)
+        result = header.rstrip() + "\n\n"
+        for entry in reversed(kept):
+            result += entry.rstrip() + "\n---\n"
+
+        path.write_text(result, encoding="utf-8")
 
     def init_evaluator_experience(self, name: str) -> None:
         experience_content = """# Learned Experience (Evaluator)

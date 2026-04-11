@@ -22,6 +22,21 @@ if TYPE_CHECKING:
 USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7_2) AppleWebKit/537.36"
 MAX_REDIRECTS = 5  # Limit redirects to prevent DoS attacks
 
+_INJECTION_PATTERNS = [
+    r"(?i)ignore\s+(all\s+)?previous\s+(instructions?|prompts?|messages?)",
+    r"(?i)disregard\s+(all\s+)?previous\s+(instructions?|prompts?|messages?)",
+    r"(?i)you\s+are\s+now\s+(?:a\s+)?(?:different|new|unrestricted)\s+(?:AI|assistant|model)",
+    r"(?i)system\s*:\s*you\s+are",
+    r"(?i)<\s*system\s*>",
+]
+
+
+def _sanitize_web_content(text: str) -> str:
+    """Strip common prompt injection patterns from web content."""
+    for pattern in _INJECTION_PATTERNS:
+        text = re.sub(pattern, "[filtered]", text)
+    return text
+
 
 def _strip_tags(text: str) -> str:
     """Remove HTML tags and decode entities."""
@@ -257,6 +272,7 @@ class WebFetchTool(Tool):
 
             if title:
                 text = f"# {title}\n\n{text}"
+            text = _sanitize_web_content(text)
             truncated = len(text) > max_chars
             if truncated:
                 text = text[:max_chars]
@@ -295,6 +311,7 @@ class WebFetchTool(Tool):
             else:
                 text, extractor = r.text, "raw"
 
+            text = _sanitize_web_content(text)
             truncated = len(text) > max_chars
             if truncated:
                 text = text[:max_chars]
