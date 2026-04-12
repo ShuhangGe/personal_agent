@@ -374,7 +374,6 @@ class SubagentManager:
             timeout=self.exec_config.timeout,
             restrict_to_workspace=True,
             path_append=self.exec_config.path_append,
-            allowed_read_dirs=[str(home_dir)],
         ))
         tools.register(WebSearchTool(config=self.web_search_config, proxy=self.web_proxy))
         tools.register(WebFetchTool(proxy=self.web_proxy))
@@ -393,6 +392,7 @@ class SubagentManager:
 
         time_ctx = ContextBuilder._build_runtime_context(None, None)
 
+        home_dir = Path.home()
         parts = [f"""# Expert Subagent
 
 {time_ctx}
@@ -403,8 +403,15 @@ You have full access to tools and skills. Stay focused on the assigned task.
 ## Your Workspace
 {expert_workspace}
 
-This is YOUR isolated workspace. All files you create or edit live here.
+This is YOUR isolated workspace. All files you create or edit MUST live here.
 Use relative paths when possible — they resolve against your workspace.
+
+## File Access
+- **read_file** and **list_dir**: Can read anywhere under `{home_dir}` (read-only).
+  Use these to access files the user references, e.g. `~/Downloads/report.pdf`.
+- **write_file** and **edit_file**: Can ONLY write inside your workspace above.
+- **exec**: Can ONLY access paths inside your workspace. Cannot read or write outside it.
+  If you need to read a file from outside, use `read_file` instead.
 """]
 
         # Load expert profile + memory if this is a known expert
