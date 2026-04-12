@@ -352,11 +352,12 @@ class AgentLoop:
             except asyncio.CancelledError:
                 logger.info("Task cancelled for session {}", msg.session_key)
                 raise
-            except Exception:
+            except Exception as exc:
                 logger.exception("Error processing message for session {}", msg.session_key)
+                error_hint = f" ({type(exc).__name__}: {str(exc)[:120]})"
                 await self.bus.publish_outbound(OutboundMessage(
                     channel=msg.channel, chat_id=msg.chat_id,
-                    content="Sorry, I encountered an error.",
+                    content=f"Sorry, I encountered an error.{error_hint}",
                 ))
 
     async def close_mcp(self) -> None:
@@ -571,7 +572,6 @@ class AgentLoop:
         max_rounds = pending["max_rounds"]
 
         if round_num >= max_rounds:
-            # Max feedback rounds reached — clear pending and suggest
             self._pending_feedback.pop(session_key, None)
             return OutboundMessage(
                 channel=msg.channel, chat_id=msg.chat_id,
@@ -587,19 +587,48 @@ class AgentLoop:
         # Update pending feedback state
         pending["round"] = round_num
 
-        # Re-spawn subagent with revision context
-        revision_ctx = (
+        # Re-spawn the subagent with revision context (the original task is
+        # already finished, so we spawn a new one rather than interrupting).
+        revision_task = (
             f"User rejected the previous result with this feedback:\n{msg.content}\n\n"
             f"Please revise the output to address the user's concerns. "
             f"This is revision round {round_num}/{max_rounds}."
         )
-        task_id = pending["task_id"]
-        await self.subagents.interrupt_task(task_id, revision_ctx)
+
+        self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"))
+        session = self.sessions.get_or_create(session_key)
+        history = session.get_history(max_messages=0)
+        initial_messages = self.context.build_messages(
+            history=history,
+            current_message=revision_task,
+            channel=msg.channel, chat_id=msg.chat_id,
+        )
+
+        async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:
+            meta = dict(msg.metadata or {})
+            meta["_progress"] = True
+            meta["_tool_hint"] = tool_hint
+            await self.bus.publish_outbound(OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id, content=content, metadata=meta,
+            ))
 
         await self.bus.publish_outbound(OutboundMessage(
             channel=msg.channel, chat_id=msg.chat_id,
             content=f"Noted. Revising based on your feedback (round {round_num}/{max_rounds})...",
         ))
+
+        final_content, _, all_msgs = await self._run_agent_loop(
+            initial_messages, on_progress=_bus_progress,
+        )
+
+        self._save_turn(session, all_msgs, 1 + len(history))
+        self.sessions.save(session)
+
+        if final_content:
+            return OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id,
+                content=final_content, metadata=msg.metadata or {},
+            )
         return None
 
     async def _update_preferences_from_feedback(
