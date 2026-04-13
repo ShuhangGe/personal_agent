@@ -93,6 +93,16 @@ class SpawnTool(Tool):
                         "Use when spawning multiple subagents that should produce results in one place."
                     ),
                 },
+                "group_id": {
+                    "type": "string",
+                    "description": (
+                        "ID to group related subagents into one batch task. "
+                        "All subagents with the same group_id are tracked together. "
+                        "You receive ONE combined notification when ALL subagents in the group finish, "
+                        "instead of individual notifications for each. "
+                        "Use any short unique identifier, e.g. 'novel-analysis-batch'."
+                    ),
+                },
             },
             "required": ["task"],
         }
@@ -106,6 +116,7 @@ class SpawnTool(Tool):
         suggested_name: str | None = None,
         suggested_description: str | None = None,
         output_dir: str | None = None,
+        group_id: str | None = None,
         **kwargs: Any,
     ) -> str:
         """Spawn a subagent to execute the given task."""
@@ -117,6 +128,7 @@ class SpawnTool(Tool):
             suggested_name=suggested_name,
             suggested_description=suggested_description,
             output_dir=output_dir,
+            group_id=group_id,
             origin_channel=self._origin_channel,
             origin_chat_id=self._origin_chat_id,
             session_key=self._session_key,

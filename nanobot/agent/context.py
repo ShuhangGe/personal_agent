@@ -127,11 +127,13 @@ Signs a task needs decomposition:
 4. **Spawn one subagent per batch**, each with:
    - Its specific item range (e.g., "process chapters 1-45")
    - The `output_dir` parameter pointing to the shared output directory
+   - The same `group_id` (e.g., "novel-batch") so all subagents are tracked as one task
    - The same `suggested_name` so all batches reuse one agent profile
 5. **Tell the user** the plan and output location.
 
 **Example:** "Analyze all 361 chapters of novel X"
 → output_dir: `/workspace/novel-analysis/`
+→ group_id: `novel-analysis-batch`
 → Batch 1: chapters 1-45, Batch 2: chapters 46-90, ... (8 subagents total)
 
 **Important:** Only decompose when items are truly independent (chapters, files, pages).

@@ -61,6 +61,8 @@ class SubagentManager:
         self._session_tasks: dict[str, set[str]] = {}
         self._interrupt_events: dict[str, asyncio.Event] = {}
         self._pending_interrupts: dict[str, str] = {}
+        self._task_groups: dict[str, dict] = {}
+        # group_id -> {"label", "total", "completed", "task_ids", "results", "output_dir", "origin"}
 
     async def spawn(
         self,
@@ -71,6 +73,7 @@ class SubagentManager:
         suggested_name: str | None = None,
         suggested_description: str | None = None,
         output_dir: str | None = None,
+        group_id: str | None = None,
         origin_channel: str = "cli",
         origin_chat_id: str = "direct",
         session_key: str | None = None,
@@ -81,12 +84,27 @@ class SubagentManager:
         display_label = label or task[:40] + ("..." if len(task) > 40 else "")
         origin = {"channel": origin_channel, "chat_id": origin_chat_id}
 
+        # Register in task group if provided
+        if group_id:
+            group = self._task_groups.setdefault(group_id, {
+                "label": label or "batch task",
+                "total": 0,
+                "completed": 0,
+                "task_ids": set(),
+                "results": [],
+                "output_dir": output_dir,
+                "origin": origin,
+            })
+            group["total"] += 1
+            group["task_ids"].add(task_id)
+
         bg_task = asyncio.create_task(
             self._run_subagent(
                 task_id, task, display_label, origin, agent_name, context,
                 suggested_name=suggested_name,
                 suggested_description=suggested_description,
                 output_dir=output_dir,
+                group_id=group_id,
                 on_progress=on_progress,
             )
         )
@@ -103,10 +121,11 @@ class SubagentManager:
 
         bg_task.add_done_callback(_cleanup)
 
+        group_info = f" [group: {group_id}]" if group_id else ""
         agent_info = f" (subagent: {agent_name})" if agent_name else " (new subagent)"
         name_info = f" as '{suggested_name}'" if suggested_name and not agent_name else ""
-        logger.info("Spawned subagent [{}]{}{}: {}", task_id, agent_info, name_info, display_label)
-        return f"Subagent{agent_info}{name_info} started for: {display_label} (id: {task_id}). I'll notify you when it completes."
+        logger.info("Spawned subagent [{}]{}{}{}: {}", task_id, agent_info, name_info, group_info, display_label)
+        return f"Subagent{agent_info}{name_info} started for: {display_label} (id: {task_id}).{group_info}"
 
     # ── Core execution ────────────────────────────────────────────────────
 
@@ -121,6 +140,7 @@ class SubagentManager:
         suggested_name: str | None = None,
         suggested_description: str | None = None,
         output_dir: str | None = None,
+        group_id: str | None = None,
         on_progress: Any = None,
     ) -> None:
         """Execute the subagent with evaluator review loop."""
@@ -323,11 +343,12 @@ class SubagentManager:
                 task_id, verdict, eval_round, elapsed,
             )
 
-            await self._announce_result(
+            await self._finish_task(
                 task_id, label, task, result_path, worklog_path, origin,
                 verdict=verdict, eval_rounds=eval_round, elapsed_seconds=elapsed,
                 evaluator_feedback=evaluator_feedback,
                 agent_dir_name=agent_dir_name,
+                group_id=group_id,
             )
 
         except Exception as e:
@@ -349,9 +370,10 @@ class SubagentManager:
                 status="error",
             )
 
-            await self._announce_result(
+            await self._finish_task(
                 task_id, label, task, result_path, worklog_path, origin,
                 verdict="ERROR", eval_rounds=0, elapsed_seconds=time.monotonic() - start_time,
+                group_id=group_id,
             )
         finally:
             self._interrupt_events.pop(task_id, None)
@@ -1262,6 +1284,91 @@ Return ONLY the compressed content, nothing else.
         return content[:max_chars]
 
     # ── Announcement ─────────────────────────────────────────────────────
+
+    async def _finish_task(
+        self,
+        task_id: str,
+        label: str,
+        task: str,
+        result_path: Path,
+        worklog_path: Path,
+        origin: dict[str, str],
+        verdict: str = "GOOD",
+        eval_rounds: int = 1,
+        elapsed_seconds: float = 0.0,
+        evaluator_feedback: str = "",
+        agent_dir_name: str = "",
+        group_id: str | None = None,
+    ) -> None:
+        """Handle task completion — announce individually or aggregate for group."""
+        if group_id and group_id in self._task_groups:
+            group = self._task_groups[group_id]
+            group["completed"] += 1
+            group["results"].append({
+                "task_id": task_id,
+                "label": label,
+                "verdict": verdict,
+                "elapsed": elapsed_seconds,
+                "result_path": str(result_path),
+            })
+
+            if group["completed"] < group["total"]:
+                # Not all done yet — log progress but don't announce
+                logger.info(
+                    "Group [{}]: {}/{} complete ({} still running)",
+                    group_id, group["completed"], group["total"],
+                    group["total"] - group["completed"],
+                )
+                return
+
+            # All done — send group announcement
+            await self._announce_group_result(group_id, group)
+            del self._task_groups[group_id]
+        else:
+            # Standalone task — announce immediately
+            await self._announce_result(
+                task_id, label, task, result_path, worklog_path, origin,
+                verdict=verdict, eval_rounds=eval_rounds, elapsed_seconds=elapsed_seconds,
+                evaluator_feedback=evaluator_feedback, agent_dir_name=agent_dir_name,
+            )
+
+    async def _announce_group_result(self, group_id: str, group: dict) -> None:
+        """Send a single aggregated announcement for a completed task group."""
+        total = group["total"]
+        results = group["results"]
+        good = sum(1 for r in results if r["verdict"] == "GOOD")
+        errors = sum(1 for r in results if r["verdict"] == "ERROR")
+        partial = total - good - errors
+        total_time = sum(r["elapsed"] for r in results)
+        label = group["label"]
+        origin = group["origin"]
+
+        summary_lines = [
+            f"Task group '{label}' ({group_id}) complete: {total} subagents finished.",
+            f"Results: {good} good, {partial} partial, {errors} errors. Total time: {total_time:.0f}s.",
+        ]
+        if group.get("output_dir"):
+            summary_lines.append(f"Output directory: {group['output_dir']}")
+        summary_lines.append("")
+        for r in results:
+            status = r["verdict"]
+            summary_lines.append(f"- {r['label']}: {status}, {r['elapsed']:.0f}s → {r['result_path']}")
+
+        summary_lines.append("")
+        summary_lines.append(
+            "Relay this to the user naturally. Summarize the overall result. "
+            "If there were errors, mention them briefly."
+        )
+
+        msg = InboundMessage(
+            channel="system",
+            sender_id="subagent",
+            chat_id=f"{origin['channel']}:{origin['chat_id']}",
+            content="\n".join(summary_lines),
+            metadata={"_group_id": group_id, "_agent_name": ""},
+        )
+        await self.bus.publish_inbound(msg)
+        logger.info("Group [{}] fully complete: {}/{}, {:.0f}s total", group_id, good, total, total_time)
 
     async def _announce_result(
         self,
