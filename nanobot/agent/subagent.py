@@ -70,6 +70,7 @@ class SubagentManager:
         context: str | None = None,
         suggested_name: str | None = None,
         suggested_description: str | None = None,
+        output_dir: str | None = None,
         origin_channel: str = "cli",
         origin_chat_id: str = "direct",
         session_key: str | None = None,
@@ -85,6 +86,7 @@ class SubagentManager:
                 task_id, task, display_label, origin, agent_name, context,
                 suggested_name=suggested_name,
                 suggested_description=suggested_description,
+                output_dir=output_dir,
                 on_progress=on_progress,
             )
         )
@@ -118,6 +120,7 @@ class SubagentManager:
         context: str | None = None,
         suggested_name: str | None = None,
         suggested_description: str | None = None,
+        output_dir: str | None = None,
         on_progress: Any = None,
     ) -> None:
         """Execute the subagent with evaluator review loop."""
@@ -144,9 +147,15 @@ class SubagentManager:
         expert_workspace = self.agent_library.get_expert_workspace(agent_dir_name)
         evaluator_workspace = self.agent_library.get_evaluator_workspace(agent_dir_name)
 
+        # Resolve output_dir for shared batch output
+        resolved_output_dir = Path(output_dir).expanduser().resolve() if output_dir else None
+
         try:
-            tools = self._build_expert_tools(expert_workspace)
-            system_prompt = self._build_expert_prompt(agent_name, context, expert_workspace, agent_dir_name)
+            tools = self._build_expert_tools(expert_workspace, resolved_output_dir)
+            system_prompt = self._build_expert_prompt(
+                agent_name, context, expert_workspace, agent_dir_name,
+                output_dir=resolved_output_dir,
+            )
 
             # Load persistent session history for known experts
             expert_session_mgr = SessionManager(
@@ -350,14 +359,18 @@ class SubagentManager:
 
     # ── Tool and prompt building ──────────────────────────────────────────
 
-    def _build_expert_tools(self, expert_workspace: Path) -> ToolRegistry:
+    def _build_expert_tools(
+        self, expert_workspace: Path, output_dir: Path | None = None,
+    ) -> ToolRegistry:
         """Build the full tool set, sandboxed to the expert's own workspace.
 
         Read-only access is granted to the user's home directory so the expert
         can read files the user references (e.g. ~/Desktop/some_file.txt).
-        Write/edit remain restricted to the expert workspace.
+        Write/edit remain restricted to the expert workspace, plus output_dir
+        if provided (for batch tasks that write to a shared directory).
         """
         home_dir = Path.home()
+        extra_write = [output_dir] if output_dir else []
         tools = ToolRegistry()
         # ReadFile and ListDir: can read from home dir (read-only)
         for cls in (ReadFileTool, ListDirTool):
@@ -366,14 +379,19 @@ class SubagentManager:
                 allowed_dir=expert_workspace,
                 read_only_dirs=[home_dir],
             ))
-        # Write and Edit: expert workspace only (no change)
+        # Write and Edit: workspace + output_dir if provided
         for cls in (WriteFileTool, EditFileTool):
-            tools.register(cls(workspace=expert_workspace, allowed_dir=expert_workspace))
+            tools.register(cls(
+                workspace=expert_workspace,
+                allowed_dir=expert_workspace,
+                extra_write_dirs=extra_write,
+            ))
         tools.register(ExecTool(
             working_dir=str(expert_workspace),
             timeout=self.exec_config.timeout,
             restrict_to_workspace=True,
             path_append=self.exec_config.path_append,
+            extra_allowed_dirs=[str(d) for d in extra_write],
         ))
         tools.register(WebSearchTool(config=self.web_search_config, proxy=self.web_proxy))
         tools.register(WebFetchTool(proxy=self.web_proxy))
@@ -385,6 +403,7 @@ class SubagentManager:
         context: str | None,
         expert_workspace: Path,
         agent_dir_name: str | None = None,
+        output_dir: Path | None = None,
     ) -> str:
         """Build the expert subagent system prompt with profile, memory, skills, and worklog instructions."""
         from nanobot.agent.context import ContextBuilder
@@ -413,6 +432,15 @@ Use relative paths when possible — they resolve against your workspace.
 - **exec**: Can ONLY access paths inside your workspace. Cannot read or write outside it.
   If you need to read a file from outside, use `read_file` instead.
 """]
+
+        if output_dir:
+            parts.append(f"""## Shared Output Directory
+{output_dir}
+
+You are part of a batch task. Write your final output files to this shared directory.
+**write_file**, **edit_file**, and **exec** can all access this directory.
+Do NOT write intermediate files here — only final results.
+""")
 
         # Load expert profile + memory if this is a known expert
         if agent_name and self.agent_library.agent_exists(agent_name):
@@ -883,7 +911,7 @@ Task ID: {task_id}
         if self.agent_library.agent_exists(agent_dir_name):
             return
 
-        description = suggested_description or f"Subagent for: {task[:80]}"
+        description = suggested_description or f"Handles tasks related to: {agent_dir_name}"
         self.agent_library.create_agent(
             name=agent_dir_name,
             description=description,

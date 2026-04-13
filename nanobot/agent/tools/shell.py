@@ -20,6 +20,7 @@ class ExecTool(Tool):
         allow_patterns: list[str] | None = None,
         restrict_to_workspace: bool = False,
         path_append: str = "",
+        extra_allowed_dirs: list[str] | None = None,
     ):
         self.timeout = timeout
         self.working_dir = working_dir
@@ -37,6 +38,7 @@ class ExecTool(Tool):
         self.allow_patterns = allow_patterns or []
         self.restrict_to_workspace = restrict_to_workspace
         self.path_append = path_append
+        self.extra_allowed_dirs = [Path(d).resolve() for d in (extra_allowed_dirs or [])]
 
     @property
     def name(self) -> str:
@@ -167,6 +169,12 @@ class ExecTool(Tool):
                 except Exception:
                     continue
                 if p.is_absolute() and cwd_path not in p.parents and p != cwd_path:
+                    # Allow paths in extra_allowed_dirs (e.g., shared output_dir)
+                    if any(
+                        rd in p.parents or p == rd
+                        for rd in self.extra_allowed_dirs
+                    ):
+                        continue
                     return "Error: Command blocked by safety guard (path outside working dir)"
 
         return None

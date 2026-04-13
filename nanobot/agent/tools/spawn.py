@@ -85,6 +85,14 @@ class SpawnTool(Tool):
                         "Example: 'Analyzes novels and long-form fiction' not 'Analyzes the novel XYZ'"
                     ),
                 },
+                "output_dir": {
+                    "type": "string",
+                    "description": (
+                        "Shared output directory for batch tasks. "
+                        "The subagent can write to this directory in addition to its own workspace. "
+                        "Use when spawning multiple subagents that should produce results in one place."
+                    ),
+                },
             },
             "required": ["task"],
         }
@@ -97,6 +105,7 @@ class SpawnTool(Tool):
         context: str | None = None,
         suggested_name: str | None = None,
         suggested_description: str | None = None,
+        output_dir: str | None = None,
         **kwargs: Any,
     ) -> str:
         """Spawn a subagent to execute the given task."""
@@ -107,6 +116,7 @@ class SpawnTool(Tool):
             context=context,
             suggested_name=suggested_name,
             suggested_description=suggested_description,
+            output_dir=output_dir,
             origin_channel=self._origin_channel,
             origin_chat_id=self._origin_chat_id,
             session_key=self._session_key,

@@ -31,13 +31,33 @@ class _FsTool(Tool):
         workspace: Path | None = None,
         allowed_dir: Path | None = None,
         read_only_dirs: list[Path] | None = None,
+        extra_write_dirs: list[Path] | None = None,
     ):
         self._workspace = workspace
         self._allowed_dir = allowed_dir
         self._read_only_dirs = read_only_dirs or []
+        self._extra_write_dirs = extra_write_dirs or []
 
     def _resolve(self, path: str) -> Path:
-        return _resolve_path(path, self._workspace, self._allowed_dir)
+        p = Path(path).expanduser()
+        if not p.is_absolute() and self._workspace:
+            p = self._workspace / p
+        resolved = p.resolve()
+        # Check main allowed dir
+        if self._allowed_dir:
+            try:
+                resolved.relative_to(self._allowed_dir.resolve())
+                return resolved
+            except ValueError:
+                pass
+        # Check extra write dirs (e.g., shared output_dir for batch tasks)
+        for d in self._extra_write_dirs:
+            try:
+                resolved.relative_to(d.resolve())
+                return resolved
+            except ValueError:
+                pass
+        raise PermissionError(f"Path {path} is outside allowed directories")
 
     def _resolve_readonly(self, path: str) -> Path:
         """Resolve path for read access — checks allowed_dir then read_only_dirs."""

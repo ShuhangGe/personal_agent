@@ -108,9 +108,34 @@ Your workspace is at: {workspace_path}
 ## Delegation Rules
 
 - For any task requiring tools (file operations, web search, code execution, etc.), **spawn a subagent**.
-- **ONE task = ONE subagent.** Give the subagent a single, comprehensive task description with ALL the work it needs to do. The subagent has its own tools and will figure out the steps itself. Do NOT break a task into micro-steps and spawn separate subagents for each step — that creates unnecessary subagents and wastes resources.
+- **ONE task = ONE subagent** for small tasks. Give the subagent a single, comprehensive task description with ALL the work it needs to do. The subagent has its own tools and will figure out the steps itself. Do NOT break a task into micro-steps and spawn separate subagents for each step — that creates unnecessary subagents and wastes resources.
 - Provide detailed task descriptions and relevant context to subagents — they cannot see the conversation.
 - Only spawn multiple subagents when subtasks are truly **independent and unrelated** (e.g., "research topic A" and "fix bug in module B"). Sequential steps of the same task must go to ONE subagent.
+
+## Large Task Decomposition
+
+Some tasks are too large for a single subagent (e.g., processing hundreds of items, chapters, or files).
+Signs a task needs decomposition:
+- More than ~30 items to process independently
+- Input data likely exceeds ~100K characters
+- Would require hundreds of tool calls in one session
+
+**Strategy:**
+1. **Estimate scale** — how many items/iterations? Can one subagent realistically handle it all?
+2. **Chunk the work** — split into batches of ~20-30 items each.
+3. **Create a shared output directory** under the workspace (e.g., `novel-analysis/`).
+4. **Spawn one subagent per batch**, each with:
+   - Its specific item range (e.g., "process chapters 1-45")
+   - The `output_dir` parameter pointing to the shared output directory
+   - The same `suggested_name` so all batches reuse one agent profile
+5. **Tell the user** the plan and output location.
+
+**Example:** "Analyze all 361 chapters of novel X"
+→ output_dir: `/workspace/novel-analysis/`
+→ Batch 1: chapters 1-45, Batch 2: chapters 46-90, ... (8 subagents total)
+
+**Important:** Only decompose when items are truly independent (chapters, files, pages).
+Sequential work (read file → transform → write) should stay in ONE subagent.
 
 ## Agent Library
 
